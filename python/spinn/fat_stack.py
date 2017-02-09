@@ -43,7 +43,7 @@ def HeKaimingInit(shape, real_shape=None):
 
     return np.random.normal(scale=np.sqrt(4.0/(fan[0] + fan[1])),
                             size=shape)
-    
+
 
 class SentencePairTrainer(BaseSentencePairTrainer):
     def init_params(self, **kwargs):
@@ -456,7 +456,7 @@ class BaseModel(Chain):
             
             # Omitting forward direction for now---redundant.
             # self.add_link('fwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim/2, seq_length=seq_length))
-            self.add_link('bwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim, seq_length=seq_length, passthrough_init=(use_encode == 2)))
+            self.add_link('bwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim, seq_length=seq_length))
 
 
     def init_mlp(self, mlp_input_dim, mlp_dim, num_classes, num_mlp_layers, mlp_bn):
