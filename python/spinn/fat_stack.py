@@ -43,17 +43,18 @@ def HeKaimingInit(shape, real_shape=None):
 
     return np.random.normal(scale=np.sqrt(4.0/(fan[0] + fan[1])),
                             size=shape)
-
+    
 
 class SentencePairTrainer(BaseSentencePairTrainer):
     def init_params(self, **kwargs):
         for name, param in self.model.namedparams():
             data = param.data
             print("Init: {}:{}".format(name, data.shape))
+
             if len(data.shape) >= 2:
                 data[:] = HeKaimingInit(data.shape)
             else:
-                data[:] = np.random.uniform(-0.1, 0.1, data.shape)
+                data[:] = np.zeros(data.shape)
 
     def init_optimizer(self, lr=0.001, clip=5.0, l2_lambda=2e-5, **kwargs):
         if kwargs["opt"] == "RMSProp":
@@ -452,8 +453,10 @@ class BaseModel(Chain):
         if self.use_encode:
             # TODO: Could probably have a buffer that is [concat(embed, fwd, bwd)] rather
             # than just [concat(fwd, bwd)]. More generally, [concat(embed, activation(embed))].
-            self.add_link('fwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim/2, seq_length=seq_length))
-            self.add_link('bwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim/2, seq_length=seq_length))
+            
+            # Omitting forward direction for now---redundant.
+            # self.add_link('fwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim/2, seq_length=seq_length))
+            self.add_link('bwd_rnn', LSTMChain(input_dim=args.size * 2, hidden_dim=model_dim, seq_length=seq_length, passthrough_init=(use_encode == 2)))
 
 
     def init_mlp(self, mlp_input_dim, mlp_dim, num_classes, num_mlp_layers, mlp_bn):
@@ -484,10 +487,11 @@ class BaseModel(Chain):
         embeds = F.concat(embeds, axis=0)
 
         if self.use_encode:
-            _, _, fwd_hs = self.fwd_rnn(embeds, train, keep_hs=True)
+            # _, _, fwd_hs = self.fwd_rnn(embeds, train, keep_hs=True)
+            print "ENC"
             _, _, bwd_hs = self.bwd_rnn(embeds, train, keep_hs=True, reverse=True)
-            hs = F.concat([fwd_hs, bwd_hs], axis=2)
-            embeds = hs
+            # hs = F.concat([fwd_hs, bwd_hs], axis=2)
+            embeds = bwd_hs
 
         embeds = [F.split_axis(x, l, axis=0, force_tuple=True) for x in embeds]
         buffers = [list(reversed(x)) for x in embeds]
