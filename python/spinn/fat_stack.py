@@ -488,7 +488,6 @@ class BaseModel(Chain):
 
         if self.use_encode:
             # _, _, fwd_hs = self.fwd_rnn(embeds, train, keep_hs=True)
-            print "ENC"
             _, _, bwd_hs = self.bwd_rnn(embeds, train, keep_hs=True, reverse=True)
             # hs = F.concat([fwd_hs, bwd_hs], axis=2)
             embeds = bwd_hs
