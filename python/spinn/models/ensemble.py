@@ -204,12 +204,17 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
     total_tokens = 0
     start = time.time()
 
-    metrics = []
+    ensemble_report_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".ensemble_report")
+
+    if FLAGS.write_ensemble_report:
+        open(ensemble_report_path, "w").close()
 
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
         if FLAGS.truncate_eval_batch:
             eval_X_batch, eval_transitions_batch = truncate(
                 eval_X_batch, eval_transitions_batch, eval_num_transitions_batch, sequential_only, FLAGS.use_left_padding)
+
+        metrics = []
 
         # Run model.
         output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
@@ -242,6 +247,17 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
 
         # Print Progress
         progress_bar.step(i+1, total=total_batches)
+
+        if FLAGS.write_ensemble_report:
+            all_targets, all_outp = zip(*metrics)
+            all_targets = torch.cat(all_targets, 0)
+            all_outp = torch.cat(all_outp, 1)
+            with open(ensemble_report_path, "a") as f:
+                for batch_idx in range(all_targets.size(0)):
+                    row = "{target},{dists}\n"
+                    target = all_targets[batch_idx]
+                    dists = all_outp[:, batch_idx].contiguous().view(-1).data.tolist()
+                    f.write(row.format(target=target, dists=",".join(str(d) for d in dists)))
     progress_bar.finish()
 
     end = time.time()
@@ -261,18 +277,6 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
 
     metrics_logger.Log('eval_class_acc', eval_class_acc, step)
     metrics_logger.Log('eval_trans_acc', eval_trans_acc, step)
-
-    if FLAGS.write_ensemble_report:
-        ensemble_report_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".ensemble_report")
-        all_targets, all_outp = zip(*metrics)
-        all_targets = torch.cat(all_targets, 0)
-        all_outp = torch.cat(all_outp, 1)
-        with open(ensemble_report_path, "w") as f:
-            for i in range(all_targets.size(0)):
-                row = "{target},{dists}\n"
-                target = all_targets[i]
-                dists = all_outp[:, 0].contiguous().view(-1).data.tolist()
-                f.write(row.format(target=target, dists=",".join(str(d) for d in dists)))
 
     return eval_class_acc
 
