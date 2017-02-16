@@ -4,6 +4,7 @@ import random
 import itertools
 import time
 import sys
+import os
 
 import numpy as np
 
@@ -27,6 +28,17 @@ CORE_VOCABULARY = {PADDING_TOKEN: 0,
 
 # Allowed number of transition types : currently PUSH : 0 and MERGE : 1
 NUM_TRANSITION_TYPES = 2
+
+
+def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
+    # Set checkpoint path.
+    if ckpt_path.endswith(suffix):
+        checkpoint_path = ckpt_path
+    else:
+        checkpoint_path = os.path.join(ckpt_path, experiment_name + suffix)
+    if best:
+        checkpoint_path += "_best"
+    return checkpoint_path
 
 
 def is_sequential_only(model_type):

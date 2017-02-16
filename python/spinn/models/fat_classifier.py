@@ -21,6 +21,7 @@ Note: If you get an error starting with "TypeError: ('Wrong number of dimensions
 
 import os
 import pprint
+import json
 import sys
 import time
 from collections import deque
@@ -34,7 +35,7 @@ from spinn.data.arithmetic import load_simple_data
 from spinn.data.boolean import load_boolean_data
 from spinn.data.sst import load_sst_data
 from spinn.data.snli import load_snli_data
-from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate
+from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate, get_checkpoint_path
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
@@ -151,17 +152,6 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
     return eval_class_acc
 
 
-def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
-    # Set checkpoint path.
-    if ckpt_path.endswith(suffix):
-        checkpoint_path = ckpt_path
-    else:
-        checkpoint_path = os.path.join(ckpt_path, experiment_name + suffix)
-    if best:
-        checkpoint_path += "_best"
-    return checkpoint_path
-
-
 def run(only_forward=False):
     logger = afs_safe_logger.Logger(os.path.join(FLAGS.log_path, FLAGS.experiment_name) + ".log")
 
@@ -180,6 +170,8 @@ def run(only_forward=False):
 
     pp = pprint.PrettyPrinter(indent=4)
     logger.Log("Flag values:\n" + pp.pformat(FLAGS.FlagValuesDict()))
+    with open(FLAGS.args_path, 'w') as f:
+        f.write(json.dumps(FLAGS.FlagValuesDict(), sort_keys=True, indent=4))
 
     # Make Metrics Logger.
     metrics_path = "{}/{}".format(FLAGS.metrics_path, FLAGS.experiment_name)
@@ -572,6 +564,7 @@ if __name__ == '__main__':
         "base for the filename.")
     gflags.DEFINE_string("metrics_path", ".", "A directory in which to write logs.")
     gflags.DEFINE_string("log_path", ".", "A directory in which to write logs.")
+    gflags.DEFINE_string("args_path", None, "Path to save args as JSON.")
     gflags.DEFINE_integer("ckpt_step", 1000, "Steps to run before considering saving checkpoint.")
     gflags.DEFINE_boolean("load_best", False, "If True, attempt to load 'best' checkpoint.")
 
@@ -684,5 +677,8 @@ if __name__ == '__main__':
 
     if not FLAGS.sha:
         FLAGS.sha = os.popen('git rev-parse HEAD').read().strip()
+
+    if not FLAGS.args_path:
+        FLAGS.args_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".json")
 
     run(only_forward=FLAGS.expanded_eval_only_mode)

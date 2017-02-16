@@ -33,7 +33,7 @@ from spinn.data.arithmetic import load_simple_data
 from spinn.data.boolean import load_boolean_data
 from spinn.data.sst import load_sst_data
 from spinn.data.snli import load_snli_data
-from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate
+from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate, get_checkpoint_path
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
@@ -72,9 +72,11 @@ class EnsembleTrainer(object):
         self.models = []
 
     def load_args(self, json_file):
-        args_dict = json.loads(open(json_file))
-        args = EnsembeArgs()
-        for k, v in args_dict:
+        with open(json_file) as f:
+            args_dict = json.loads(f.read())
+        args = EnsembleArgs()
+        for k, v in args_dict.iteritems():
+            v = str(v) if type(v) == unicode else v
             setattr(args, k, v)
         return args
 
@@ -150,7 +152,7 @@ class EnsembleTrainer(object):
 
     def _add_model(self, name, args, model, optimizer, trainer, step, best_dev_error):
         ensemble_model = EnsembleModel()
-        ensemble_model.name = name
+        ensemble_model.name = name if name is not None else args.experiment_name
         ensemble_model.args = args
         ensemble_model.model = model
         ensemble_model.optimizer = optimizer
@@ -160,17 +162,17 @@ class EnsembleTrainer(object):
 
         self.models.append(ensemble_model)
 
-    def add_model(self, json_file, name='model'):
+    def add_model(self, json_file, name=None):
         args = self.load_args(json_file)
-        ckpt_path = args.ckpt_path
 
-        trainer_cls, model_cls = self.get_classes(data_manager)
+        trainer_cls, model_cls = self.get_classes(args)
 
         model = self.build_model(args, model_cls)
         optimizer = self.build_optimizer(args, model)
         trainer = self.build_trainer(args, model, optimizer, trainer_cls)
 
-        step, best_dev_error = trainer.load(ckpt_path)
+        standard_ckpt_path = get_checkpoint_path(args.ckpt_path, args.experiment_name)
+        step, best_dev_error = trainer.load(standard_ckpt_path)
 
         self._add_model(name, args, model, optimizer, trainer, step, best_dev_error)
 
@@ -186,7 +188,11 @@ class EnsembleTrainer(object):
                 validate_transitions=args.validate_transitions)
 
             outputs.append(outp)
-        return outputs
+
+        # TODO: Provide other options beside average.
+        avgd = torch.cat([outp.unsqueeze(0) for outp in outputs], 0).mean(0).squeeze(0)
+
+        return avgd
 
 
 def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary=None):
@@ -211,9 +217,7 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
             use_internal_parser=FLAGS.use_internal_parser,
             validate_transitions=FLAGS.validate_transitions)
 
-        # TODO: Logits
-        assert len(output) == len(model.models)
-        import ipdb; ipdb.set_trace()
+        logits = F.log_softmax(output)
 
         # Calculate class accuracy.
         target = torch.from_numpy(eval_y_batch).long()
@@ -313,7 +317,7 @@ def run(only_forward=False):
     else:
         initial_embeddings = None
 
-    sequential_only = is_sequential_only(FLAGS.model_type)
+    sequential_only = False
 
     # Preprocess eval sets.
     eval_iterators = []
@@ -333,6 +337,9 @@ def run(only_forward=False):
 
     step = -1
     model = EnsembleTrainer(data_manager, initial_embeddings)
+    ensemble_paths = FLAGS.ensemble_path.split(',')
+    for ep in ensemble_paths:
+        model.add_model(ep)
 
     # Ensemble only supports eval right now.
     for index, eval_set in enumerate(eval_iterators):
@@ -353,6 +360,8 @@ if __name__ == '__main__':
         "Which data handler and classifier to use.")
 
     # Where to store checkpoints
+    gflags.DEFINE_string("ensemble_path", None, "List of comma-seperated files that hold"
+        "JSON arguments for saved models.")
     gflags.DEFINE_string("ckpt_path", ".", "Where to save/load checkpoints. Can be either "
         "a filename or a directory. In the latter case, the experiment name serves as the "
         "base for the filename.")
