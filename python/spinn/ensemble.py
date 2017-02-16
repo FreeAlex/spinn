@@ -1,22 +1,11 @@
-"""From the project root directory (containing data files), this can be run with:
+"""
 
-Boolean logic evaluation:
-python -m spinn.models.fat_classifier --training_data_path ../bl-data/pbl_train.tsv \
-       --eval_data_path ../bl-data/pbl_dev.tsv
+Multiple Models:
 
-SST sentiment (Demo only, model needs a full GloVe embeddings file to do well):
-python -m spinn.models.fat_classifier --data_type sst --training_data_path sst-data/train.txt \
-       --eval_data_path sst-data/dev.txt --embedding_data_path spinn/tests/test_embedding_matrix.5d.txt \
-       --model_dim 10 --word_embedding_dim 5
+1. Specify JSON files that contain all necessary information for each model.
+2. Keep the args from the JSON file. Load the ckpt specified in JSON file. Create
+    model based off the args.
 
-SNLI entailment (Demo only, model needs a full GloVe embeddings file to do well):
-python -m spinn.models.fat_classifier --data_type snli --training_data_path snli_1.0/snli_1.0_dev.jsonl \
-       --eval_data_path snli_1.0/snli_1.0_dev.jsonl --embedding_data_path spinn/tests/test_embedding_matrix.5d.txt \
-       --model_dim 10 --word_embedding_dim 5
-
-Note: If you get an error starting with "TypeError: ('Wrong number of dimensions..." during development,
-    there may already be a saved checkpoint in ckpt_path that matches the name of the model you're developing.
-    Move or delete it as appropriate.
 """
 
 import os
@@ -34,7 +23,7 @@ from spinn.data.arithmetic import load_simple_data
 from spinn.data.boolean import load_boolean_data
 from spinn.data.sst import load_sst_data
 from spinn.data.snli import load_snli_data
-from spinn.util.data import SimpleProgressBar
+from spinn.util.data import SimpleProgressBar, sequential_only, truncate
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
@@ -52,30 +41,6 @@ import torch.optim as optim
 
 
 FLAGS = gflags.FLAGS
-
-
-def sequential_only():
-    return FLAGS.model_type == "RNN" or FLAGS.model_type == "CBOW"
-
-
-def truncate(X_batch, transitions_batch, num_transitions_batch):
-    # Truncate each batch to max length within the batch.
-    X_batch_is_left_padded = (not FLAGS.use_left_padding or sequential_only())
-    transitions_batch_is_left_padded = FLAGS.use_left_padding
-    max_transitions = np.max(num_transitions_batch)
-    seq_length = X_batch.shape[1]
-
-    if X_batch_is_left_padded:
-        X_batch = X_batch[:, seq_length - max_transitions:]
-    else:
-        X_batch = X_batch[:, :max_transitions]
-
-    if transitions_batch_is_left_padded:
-        transitions_batch = transitions_batch[:, seq_length - max_transitions:]
-    else:
-        transitions_batch = transitions_batch[:, :max_transitions]
-
-    return X_batch, transitions_batch
 
 
 def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
@@ -373,206 +338,9 @@ def run(only_forward=False):
     # Accumulate useful statistics.
     A = Accumulator(maxlen=FLAGS.deque_length)
 
-    # Do an evaluation-only run.
-    if only_forward:
-        for index, eval_set in enumerate(eval_iterators):
-            acc = evaluate(model, eval_set, logger, metrics_logger, step, vocabulary)
-    else:
-         # Train
-        logger.Log("Training.")
-
-        # New Training Loop
-        progress_bar = SimpleProgressBar(msg="Training", bar_length=60, enabled=FLAGS.show_progress_bar)
-        progress_bar.step(i=0, total=FLAGS.statistics_interval_steps)
-
-        for step in range(step, FLAGS.training_steps):
-            model.train()
-
-            start = time.time()
-
-            X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = training_data_iter.next()
-
-            if FLAGS.truncate_train_batch:
-                X_batch, transitions_batch = truncate(
-                    X_batch, transitions_batch, num_transitions_batch)
-
-            total_tokens = num_transitions_batch.ravel().sum()
-
-            # Reset cached gradients.
-            optimizer.zero_grad()
-
-            # Run model.
-            output = model(X_batch, transitions_batch, y_batch,
-                use_internal_parser=FLAGS.use_internal_parser,
-                validate_transitions=FLAGS.validate_transitions
-                )
-
-            # Normalize output.
-            logits = F.log_softmax(output)
-
-            # Calculate class accuracy.
-            target = torch.from_numpy(y_batch).long()
-            pred = logits.data.max(1)[1].cpu() # get the index of the max log-probability
-            class_acc = pred.eq(target).sum() / float(target.size(0))
-
-            A.add('class_acc', class_acc)
-            M.add('class_acc', class_acc)
-
-            # Calculate class loss.
-            xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
-
-            # Optionally calculate transition loss/accuracy.
-            transition_acc = model.transition_acc if hasattr(model, 'transition_acc') else 0.0
-            transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
-            rl_loss = model.rl_loss if hasattr(model, 'rl_loss') else None
-            policy_loss = model.policy_loss if hasattr(model, 'policy_loss') else None
-
-            # Force Transition Loss Optimization
-            if FLAGS.force_transition_loss:
-                model.optimize_transition_loss = True
-
-            # Accumulate stats for transition accuracy.
-            if transition_loss is not None:
-                preds = [m["t_preds"] for m in model.spinn.memories]
-                truth = [m["t_given"] for m in model.spinn.memories]
-                A.add('preds', preds)
-                A.add('truth', truth)
-
-            # Note: Keep track of transition_acc, although this is a naive average.
-            # Should be weighted by length of sequences in batch.
-            M.add('transition_acc', transition_acc)
-
-            # Extract L2 Cost
-            l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
-
-            # Boilerplate for calculating loss values.
-            xent_cost_val = xent_loss.data[0]
-            transition_cost_val = transition_loss.data[0] if transition_loss is not None else 0.0
-            l2_cost_val = l2_loss.data[0] if l2_loss is not None else 0.0
-            rl_cost_val = rl_loss.data[0] if rl_loss is not None else 0.0
-            policy_cost_val = policy_loss.data[0] if policy_loss is not None else 0.0
-
-            # Accumulate Total Loss Data
-            total_cost_val = 0.0
-            total_cost_val += xent_cost_val
-            if transition_loss is not None and model.optimize_transition_loss:
-                total_cost_val += transition_cost_val
-            total_cost_val += l2_cost_val
-            total_cost_val += rl_cost_val
-            total_cost_val += policy_cost_val
-
-            M.add('total_cost', total_cost_val)
-            M.add('xent_cost', xent_cost_val)
-            M.add('transition_cost', transition_cost_val)
-            M.add('l2_cost', l2_cost_val)
-
-            # Logging for RL
-            rl_keys = ['rl_loss', 'policy_loss', 'norm_rewards', 'norm_baseline', 'norm_advantage']
-            for k in rl_keys:
-                if hasattr(model, k):
-                    val = getattr(model, k)
-                    val = val.data[0] if isinstance(val, Variable) else val
-                    M.add(k, val)
-
-            # Accumulate Total Loss Variable
-            total_loss = 0.0
-            total_loss += xent_loss
-            if l2_loss is not None:
-                total_loss += l2_loss
-            if transition_loss is not None and model.optimize_transition_loss:
-                total_loss += transition_loss
-            if rl_loss is not None:
-                total_loss += rl_loss
-            if policy_loss is not None:
-                total_loss += policy_loss
-
-            # Useful for debugging gradient flow.
-            if FLAGS.debug:
-                losses = [('total_loss', total_loss), ('xent_loss', xent_loss)]
-                if l2_loss is not None:
-                    losses.append(('l2_loss', l2_loss))
-                if transition_loss is not None and model.optimize_transition_loss:
-                    losses.append(('transition_loss', transition_loss))
-                if rl_loss is not None:
-                    losses.append(('rl_loss', rl_loss))
-                if policy_loss is not None:
-                    losses.append(('policy_loss', policy_loss))
-                debug_gradient(model, losses)
-                import ipdb; ipdb.set_trace()
-
-            # Backward pass.
-            total_loss.backward()
-
-            # Hard Gradient Clipping
-            clip = FLAGS.clipping_max_value
-            for p in model.parameters():
-                if p.requires_grad:
-                    p.grad.data.clamp_(min=-clip, max=clip)
-
-            # Learning Rate Decay
-            if FLAGS.actively_decay_learning_rate:
-                optimizer.lr = FLAGS.learning_rate * (FLAGS.learning_rate_decay_per_10k_steps ** (step / 10000.0))
-
-            # Gradient descent step.
-            optimizer.step()
-
-            end = time.time()
-
-            total_time = end - start
-
-            A.add('total_tokens', total_tokens)
-            A.add('total_time', total_time)
-
-            if step % FLAGS.statistics_interval_steps == 0:
-                progress_bar.step(i=FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
-                progress_bar.finish()
-                avg_class_acc = A.get_avg('class_acc')
-                if transition_loss is not None:
-                    all_preds = np.array(flatten(A.get('preds')))
-                    all_truth = np.array(flatten(A.get('truth')))
-                    avg_trans_acc = (all_preds == all_truth).sum() / float(all_truth.shape[0])
-                else:
-                    avg_trans_acc = 0.0
-                time_metric = time_per_token(A.get('total_tokens'), A.get('total_time'))
-                stats_args = {
-                    "step": step,
-                    "class_acc": avg_class_acc,
-                    "transition_acc": avg_trans_acc,
-                    "total_cost": total_cost_val,
-                    "xent_cost": xent_cost_val,
-                    "transition_cost": transition_cost_val,
-                    "l2_cost": l2_cost_val,
-                    "rl_cost": rl_cost_val,
-                    "policy_cost": policy_cost_val,
-                    "time": time_metric,
-                }
-                stats_str = "Step: {step} Acc: {class_acc:.5f} {transition_acc:.5f} Cost: {total_cost:.5f} {xent_cost:.5f} {transition_cost:.5f} {l2_cost:.5f}"
-                if rl_loss is not None:
-                    stats_str += " r{rl_cost:.5f}"
-                if policy_loss is not None:
-                    stats_str += " p{policy_cost:.5f}"
-                stats_str += " Time: {time:.5f}"
-                logger.Log(stats_str.format(**stats_args))
-
-            if step > 0 and step % FLAGS.eval_interval_steps == 0:
-                for index, eval_set in enumerate(eval_iterators):
-                    acc = evaluate(model, eval_set, logger, metrics_logger, step)
-                    if FLAGS.ckpt_on_best_dev_error and index == 0 and (1 - acc) < 0.99 * best_dev_error and step > FLAGS.ckpt_step:
-                        best_dev_error = 1 - acc
-                        logger.Log("Checkpointing with new best dev accuracy of %f" % acc)
-                        classifier_trainer.save(best_checkpoint_path, step, best_dev_error)
-                progress_bar.reset()
-
-            if step > FLAGS.ckpt_step and step % FLAGS.ckpt_interval_steps == 0:
-                logger.Log("Checkpointing.")
-                classifier_trainer.save(standard_checkpoint_path, step, best_dev_error)
-
-            if step % FLAGS.metrics_interval_steps == 0:
-                m_keys = M.cache.keys()
-                for k in m_keys:
-                    metrics_logger.Log(k, M.get_avg(k), step)
-
-            progress_bar.step(i=step % FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
+    # Ensemble only supports eval right now.
+    for index, eval_set in enumerate(eval_iterators):
+        acc = evaluate(model, eval_set, logger, metrics_logger, step, vocabulary)
 
 
 if __name__ == '__main__':

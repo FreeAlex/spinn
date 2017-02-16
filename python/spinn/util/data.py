@@ -29,6 +29,30 @@ CORE_VOCABULARY = {PADDING_TOKEN: 0,
 NUM_TRANSITION_TYPES = 2
 
 
+def sequential_only():
+    return FLAGS.model_type == "RNN" or FLAGS.model_type == "CBOW"
+
+
+def truncate(X_batch, transitions_batch, num_transitions_batch):
+    # Truncate each batch to max length within the batch.
+    X_batch_is_left_padded = (not FLAGS.use_left_padding or sequential_only())
+    transitions_batch_is_left_padded = FLAGS.use_left_padding
+    max_transitions = np.max(num_transitions_batch)
+    seq_length = X_batch.shape[1]
+
+    if X_batch_is_left_padded:
+        X_batch = X_batch[:, seq_length - max_transitions:]
+    else:
+        X_batch = X_batch[:, :max_transitions]
+
+    if transitions_batch_is_left_padded:
+        transitions_batch = transitions_batch[:, seq_length - max_transitions:]
+    else:
+        transitions_batch = transitions_batch[:, :max_transitions]
+
+    return X_batch, transitions_batch
+
+
 def create_tree(words, transitions):
     template_start = """
     digraph G {
