@@ -204,6 +204,8 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
     total_tokens = 0
     start = time.time()
 
+    metrics = []
+
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
         if FLAGS.truncate_eval_batch:
             eval_X_batch, eval_transitions_batch = truncate(
@@ -216,20 +218,21 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
 
         output = torch.cat([outp.unsqueeze(0) for outp in output], 0)
 
+        normalized_output = torch.cat([F.softmax(oo).unsqueeze(0) for oo in output], 0)
         if FLAGS.ensemble_type == "mean":
-            dist = torch.cat([F.softmax(oo).unsqueeze(0) for oo in output], 0)
-            dist = dist.mean(0).squeeze(0)
+            modified = normalized_output.mean(0).squeeze(0)
         elif FLAGS.ensemble_type == "max":
-            dist = torch.cat([F.softmax(oo).unsqueeze(0) for oo in output], 0)
-            dist = dist.max(0)[0].squeeze(0)
+            modified = normalized_output.max(0)[0].squeeze(0)
         else:
             raise NotImplementedError
 
         # Calculate class accuracy.
         target = torch.from_numpy(eval_y_batch).long()
-        pred = dist.data.max(1)[1].cpu() # get the index of the max log-probability
+        pred = modified.data.max(1)[1].cpu() # get the index of the max log-probability
         class_correct += pred.eq(target).sum()
         class_total += target.size(0)
+
+        metrics.append([target, normalized_output])
 
         # Optionally calculate transition loss/acc.
         transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
@@ -259,9 +262,17 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
     metrics_logger.Log('eval_class_acc', eval_class_acc, step)
     metrics_logger.Log('eval_trans_acc', eval_trans_acc, step)
 
-    if FLAGS.write_eval_report:
-        eval_report_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".report")
-        reporter.write_report(eval_report_path)
+    if FLAGS.write_ensemble_report:
+        ensemble_report_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".ensemble_report")
+        all_targets, all_outp = zip(*metrics)
+        all_targets = torch.cat(all_targets, 0)
+        all_outp = torch.cat(all_outp, 1)
+        with open(ensemble_report_path, "w") as f:
+            for i in range(all_targets.size(0)):
+                row = "{target},{dists}\n"
+                target = all_targets[i]
+                dists = all_outp[:, 0].contiguous().view(-1).data.tolist()
+                f.write(row.format(target=target, dists=",".join(str(d) for d in dists)))
 
     return eval_class_acc
 
@@ -400,6 +411,7 @@ if __name__ == '__main__':
     gflags.DEFINE_string("ensemble_path", None, "List of comma-seperated files that hold"
         "JSON arguments for saved models.")
     gflags.DEFINE_enum("ensemble_type", "mean", ["mean", "max"], "")
+    gflags.DEFINE_boolean("write_ensemble_report", True, "")
 
     # Model architecture settings.
     gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN"], "")
