@@ -189,10 +189,7 @@ class EnsembleTrainer(object):
 
             outputs.append(outp)
 
-        # TODO: Provide other options beside average.
-        avgd = torch.cat([outp.unsqueeze(0) for outp in outputs], 0).mean(0).squeeze(0)
-
-        return avgd
+        return outputs
 
 
 def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary=None):
@@ -217,11 +214,20 @@ def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, voc
             use_internal_parser=FLAGS.use_internal_parser,
             validate_transitions=FLAGS.validate_transitions)
 
-        logits = F.log_softmax(output)
+        output = torch.cat([outp.unsqueeze(0) for outp in output], 0)
+
+        if FLAGS.ensemble_type == "mean":
+            dist = torch.cat([F.softmax(oo).unsqueeze(0) for oo in output], 0)
+            dist = dist.mean(0).squeeze(0)
+        elif FLAGS.ensemble_type == "max":
+            dist = torch.cat([F.softmax(oo).unsqueeze(0) for oo in output], 0)
+            dist = dist.max(0)[0].squeeze(0)
+        else:
+            raise NotImplementedError
 
         # Calculate class accuracy.
         target = torch.from_numpy(eval_y_batch).long()
-        pred = logits.data.max(1)[1].cpu() # get the index of the max log-probability
+        pred = dist.data.max(1)[1].cpu() # get the index of the max log-probability
         class_correct += pred.eq(target).sum()
         class_total += target.size(0)
 
@@ -360,8 +366,6 @@ if __name__ == '__main__':
         "Which data handler and classifier to use.")
 
     # Where to store checkpoints
-    gflags.DEFINE_string("ensemble_path", None, "List of comma-seperated files that hold"
-        "JSON arguments for saved models.")
     gflags.DEFINE_string("ckpt_path", ".", "Where to save/load checkpoints. Can be either "
         "a filename or a directory. In the latter case, the experiment name serves as the "
         "base for the filename.")
@@ -391,6 +395,11 @@ if __name__ == '__main__':
     # Data preprocessing settings.
     gflags.DEFINE_boolean("use_skips", False, "Pad transitions with SKIP actions.")
     gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
+
+    # Ensemble settings.
+    gflags.DEFINE_string("ensemble_path", None, "List of comma-seperated files that hold"
+        "JSON arguments for saved models.")
+    gflags.DEFINE_enum("ensemble_type", "mean", ["mean", "max"], "")
 
     # Model architecture settings.
     gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN"], "")
