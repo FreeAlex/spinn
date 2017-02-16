@@ -6,11 +6,21 @@ Multiple Models:
 2. Keep the args from the JSON file. Load the ckpt specified in JSON file. Create
     model based off the args.
 
+Missing Features:
+
+1. Loss
+2. Eval Report
+3. Eval/Train Mode
+4. Set GPU
+5. Set Debug
+6. Transition Accuracy
+
 """
 
 import os
-import pprint
 import sys
+import json
+import pprint
 import time
 from collections import deque
 
@@ -43,10 +53,143 @@ import torch.optim as optim
 FLAGS = gflags.FLAGS
 
 
+class EnsembleArgs(object):
+    pass
+
+
+class EnsembleModel(object):
+    pass
+
+
+class EnsembleTrainer(object):
+    def __init__(self, data_manager, initial_embeddings):
+        super(Ens, self).__init__()
+        self.initial_embeddings = initial_embeddings
+        self.data_manager = data_manager
+        self.vocab_size = initial_embeddings.shape[0]
+        self.num_classes = len(data_manager.LABEL_MAP)
+        self.use_sentence_pair = data_manager.SENTENCE_PAIR_DATA
+        self.models = []
+
+    def load_args(self, json_file):
+        args_dict = json.loads(open(json_file))
+        args = EnsembeArgs()
+        for k, v in args_dict:
+            setattr(args, k, v)
+        return args
+
+    def get_classes(self, args):
+        if args.model_type == "CBOW":
+            model_module = spinn.cbow
+        elif args.model_type == "RNN":
+            model_module = spinn.plain_rnn
+        elif args.model_type == "SPINN":
+            model_module = spinn.fat_stack
+        elif args.model_type == "RLSPINN":
+            model_module = spinn.rl_spinn
+        else:
+            raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
+
+        if self.use_sentence_pair:
+            trainer_cls = model_module.SentencePairTrainer
+            model_cls = model_module.SentencePairModel
+        else:
+            trainer_cls = model_module.SentenceTrainer
+            model_cls = model_module.SentenceModel
+        return trainer_cls, model_cls
+
+    def build_model(self, args, model_cls):
+
+        initial_embeddings = ?
+        vocab_size = ?
+        use_sentence_pair = ?
+        num_classes = ?
+
+        model = model_cls(model_dim=args.model_dim,
+            word_embedding_dim=args.word_embedding_dim,
+            vocab_size=vocab_size,
+            initial_embeddings=initial_embeddings,
+            num_classes=num_classes,
+            mlp_dim=args.mlp_dim,
+            embedding_keep_rate=args.embedding_keep_rate,
+            classifier_keep_rate=args.semantic_classifier_keep_rate,
+            tracking_lstm_hidden_dim=args.tracking_lstm_hidden_dim,
+            transition_weight=args.transition_weight,
+            use_encode=args.use_encode,
+            encode_reverse=args.encode_reverse,
+            encode_bidirectional=args.encode_bidirectional,
+            encode_num_layers=args.encode_num_layers,
+            use_sentence_pair=use_sentence_pair,
+            use_skips=args.use_skips,
+            lateral_tracking=args.lateral_tracking,
+            use_tracking_in_composition=args.use_tracking_in_composition,
+            use_difference_feature=args.use_difference_feature,
+            use_product_feature=args.use_product_feature,
+            num_mlp_layers=args.num_mlp_layers,
+            mlp_bn=args.mlp_bn,
+            rl_mu=args.rl_mu,
+            rl_baseline=args.rl_baseline,
+            rl_reward=args.rl_reward,
+            rl_weight=args.rl_weight,
+        )
+
+        return model
+
+    def build_optimizer(self, args, model):
+        # Build optimizer.
+        if args.optimizer_type == "Adam":
+            optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-08)
+        elif args.optimizer_type == "RMSProp":
+            optimizer = optim.RMSprop(model.parameters(), lr=args.learning_rate, eps=1e-08)
+        else:
+            raise NotImplementedError
+        return optimizer
+
+    def build_trainer(self, args, model, optimizer, trainer_cls):
+        return trainer_cls(model, optimizer)
+
+    def _add_model(self, name, args, model, optimizer, trainer, step, best_dev_error):
+        ensemble_model = EnsembleModel()
+        ensemble_model.name = name
+        ensemble_model.args = args
+        ensemble_model.model = model
+        ensemble_model.optimizer = optimizer
+        ensemble_model.step = step
+        ensemble_model.trainer = trainer
+        ensemble_model.best_dev_error = best_dev_error
+
+        self.models.append(ensemble_model)
+
+    def add_model(self, json_file, name='model'):
+        args = self.load_args(json_file)
+        ckpt_path = args.ckpt_path
+
+        trainer_cls, model_cls = self.get_classes(data_manager)
+
+        model = self.build_model(args, model_cls)
+        optimizer = self.build_optimizer(args, model)
+        trainer = self.build_trainer(args, model, optimizer, trainer_cls)
+
+        step, best_dev_error = trainer.load(ckpt_path)
+
+        self._add_model(name, args, model, optimizer, trainer, step, best_dev_error)
+
+    def __call__(self, x_batch, transitions_batch, y_batch):
+        outputs = []
+        for ensemble_model in self.models:
+            model = ensemble_model.model
+            args = ensemble_model.args
+
+            outp = model(x_batch, transitions_batch, y_batch,
+                use_internal_parser=args.use_internal_parser,
+                validate_transitions=args.validate_transitions)
+
+            outputs.append(outp)
+        return outputs
+
+
 def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     filename, dataset = eval_set
-
-    reporter = EvalReporter()
 
     # Evaluate
     class_correct = 0
@@ -56,11 +199,6 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     progress_bar.step(0, total=total_batches)
     total_tokens = 0
     start = time.time()
-
-    model.eval()
-
-    transition_preds = []
-    transition_targets = []
 
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
         if FLAGS.truncate_eval_batch:
@@ -72,8 +210,9 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
             use_internal_parser=FLAGS.use_internal_parser,
             validate_transitions=FLAGS.validate_transitions)
 
-        # Normalize output.
-        logits = F.log_softmax(output)
+        # TODO: Logits
+        assert len(output) == len(model.models)
+        import ipdb; ipdb.set_trace()
 
         # Calculate class accuracy.
         target = torch.from_numpy(eval_y_batch).long()
@@ -86,25 +225,6 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
 
         # Update Aggregate Accuracies
         total_tokens += eval_num_transitions_batch.ravel().sum()
-
-        # Accumulate stats for transition accuracy.
-        if transition_loss is not None:
-            transition_preds.append([m["t_preds"] for m in model.spinn.memories])
-            transition_targets.append([m["t_given"] for m in model.spinn.memories])
-
-        if FLAGS.write_eval_report:
-            reporter_args = [pred, target, eval_ids]
-            if hasattr(model, 'transition_loss'):
-                transition_preds_per_example = model.spinn.get_transition_preds_per_example()
-                if model.use_sentence_pair:
-                    batch_size = pred.size(0)
-                    sent1_preds = transition_preds_per_example[:batch_size]
-                    sent2_preds = transition_preds_per_example[batch_size:]
-                    reporter_args.append(sent1_preds)
-                    reporter_args.append(sent2_preds)
-                else:
-                    reporter_args.append(transition_preds_per_example)
-            reporter.save_batch(*reporter_args)
 
         # Print Progress
         progress_bar.step(i+1, total=total_batches)
@@ -119,13 +239,8 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     # Get class accuracy.
     eval_class_acc = class_correct / float(class_total)
 
-    # Get transition accuracy if applicable.
-    if len(transition_preds) > 0:
-        all_preds = np.array(flatten(transition_preds))
-        all_truth = np.array(flatten(transition_targets))
-        eval_trans_acc = (all_preds == all_truth).sum() / float(all_truth.shape[0])
-    else:
-        eval_trans_acc = 0.0
+    # TODO: Transition Accuracy
+    eval_trans_acc = 0.0
 
     logger.Log("Step: %i Eval acc: %f  %f %s Time: %5f" %
               (step, eval_class_acc, eval_trans_acc, filename, time_metric))
@@ -138,17 +253,6 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
         reporter.write_report(eval_report_path)
 
     return eval_class_acc
-
-
-def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
-    # Set checkpoint path.
-    if ckpt_path.endswith(suffix):
-        checkpoint_path = ckpt_path
-    else:
-        checkpoint_path = os.path.join(ckpt_path, experiment_name + suffix)
-    if best:
-        checkpoint_path += "_best"
-    return checkpoint_path
 
 
 def run(only_forward=False):
@@ -235,108 +339,8 @@ def run(only_forward=False):
             shuffle=FLAGS.shuffle_eval, rseed=FLAGS.shuffle_eval_seed)
         eval_iterators.append((filename, eval_it))
 
-    # Choose model.
-    logger.Log("Building model.")
-    if FLAGS.model_type == "CBOW":
-        model_module = spinn.cbow
-    elif FLAGS.model_type == "RNN":
-        model_module = spinn.plain_rnn
-    elif FLAGS.model_type == "SPINN":
-        model_module = spinn.fat_stack
-    elif FLAGS.model_type == "RLSPINN":
-        model_module = spinn.rl_spinn
-    else:
-        raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
-
-    # Build model.
-    vocab_size = len(vocabulary)
-    num_classes = len(data_manager.LABEL_MAP)
-
-    if data_manager.SENTENCE_PAIR_DATA:
-        trainer_cls = model_module.SentencePairTrainer
-        model_cls = model_module.SentencePairModel
-        use_sentence_pair = True
-    else:
-        trainer_cls = model_module.SentenceTrainer
-        model_cls = model_module.SentenceModel
-        num_classes = len(data_manager.LABEL_MAP)
-        use_sentence_pair = False
-
-    model = model_cls(model_dim=FLAGS.model_dim,
-         word_embedding_dim=FLAGS.word_embedding_dim,
-         vocab_size=vocab_size,
-         initial_embeddings=initial_embeddings,
-         num_classes=num_classes,
-         mlp_dim=FLAGS.mlp_dim,
-         embedding_keep_rate=FLAGS.embedding_keep_rate,
-         classifier_keep_rate=FLAGS.semantic_classifier_keep_rate,
-         tracking_lstm_hidden_dim=FLAGS.tracking_lstm_hidden_dim,
-         transition_weight=FLAGS.transition_weight,
-         use_encode=FLAGS.use_encode,
-         encode_reverse=FLAGS.encode_reverse,
-         encode_bidirectional=FLAGS.encode_bidirectional,
-         encode_num_layers=FLAGS.encode_num_layers,
-         use_sentence_pair=use_sentence_pair,
-         use_skips=FLAGS.use_skips,
-         lateral_tracking=FLAGS.lateral_tracking,
-         use_tracking_in_composition=FLAGS.use_tracking_in_composition,
-         use_difference_feature=FLAGS.use_difference_feature,
-         use_product_feature=FLAGS.use_product_feature,
-         num_mlp_layers=FLAGS.num_mlp_layers,
-         mlp_bn=FLAGS.mlp_bn,
-         rl_mu=FLAGS.rl_mu,
-         rl_baseline=FLAGS.rl_baseline,
-         rl_reward=FLAGS.rl_reward,
-         rl_weight=FLAGS.rl_weight,
-        )
-
-    # Build optimizer.
-    if FLAGS.optimizer_type == "Adam":
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate, betas=(0.9, 0.999), eps=1e-08)
-    elif FLAGS.optimizer_type == "RMSProp":
-        optimizer = optim.RMSprop(model.parameters(), lr=FLAGS.learning_rate, eps=1e-08)
-    else:
-        raise NotImplementedError
-
-    # Build trainer.
-    classifier_trainer = trainer_cls(model, optimizer)
-
-    standard_checkpoint_path = get_checkpoint_path(FLAGS.ckpt_path, FLAGS.experiment_name)
-    best_checkpoint_path = get_checkpoint_path(FLAGS.ckpt_path, FLAGS.experiment_name, best=True)
-
-    # Load checkpoint if available.
-    if FLAGS.load_best and os.path.isfile(best_checkpoint_path):
-        logger.Log("Found best checkpoint, restoring.")
-        step, best_dev_error = classifier_trainer.load(best_checkpoint_path)
-        logger.Log("Resuming at step: {} with best dev accuracy: {}".format(step, 1. - best_dev_error))
-    elif os.path.isfile(standard_checkpoint_path):
-        logger.Log("Found checkpoint, restoring.")
-        step, best_dev_error = classifier_trainer.load(standard_checkpoint_path)
-        logger.Log("Resuming at step: {} with best dev accuracy: {}".format(step, 1. - best_dev_error))
-    else:
-        assert not only_forward, "Can't run an eval-only run without a checkpoint. Supply a checkpoint."
-        step = 0
-        best_dev_error = 1.0
-
-    # Print model size.
-    logger.Log("Architecture: {}".format(model))
-    total_params = sum([reduce(lambda x, y: x * y, w.size(), 1.0) for w in model.parameters()])
-    logger.Log("Total params: {}".format(total_params))
-
-    # GPU support.
-    the_gpu.gpu = FLAGS.gpu
-    if FLAGS.gpu >= 0:
-        model.cuda()
-    else:
-        model.cpu()
-
-    # Debug
-    def set_debug(self):
-        self.debug = FLAGS.debug
-    model.apply(set_debug)
-
-    # Accumulate useful statistics.
-    A = Accumulator(maxlen=FLAGS.deque_length)
+    step = -1
+    model = EnsembleTrainer(data_manager, initial_embeddings)
 
     # Ensemble only supports eval right now.
     for index, eval_set in enumerate(eval_iterators):
