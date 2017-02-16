@@ -34,7 +34,7 @@ from spinn.data.arithmetic import load_simple_data
 from spinn.data.boolean import load_boolean_data
 from spinn.data.sst import load_sst_data
 from spinn.data.snli import load_snli_data
-from spinn.util.data import SimpleProgressBar, sequential_only, truncate
+from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
@@ -54,7 +54,7 @@ import torch.optim as optim
 FLAGS = gflags.FLAGS
 
 
-def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
+def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary=None):
     filename, dataset = eval_set
 
     reporter = EvalReporter()
@@ -76,7 +76,7 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
         if FLAGS.truncate_eval_batch:
             eval_X_batch, eval_transitions_batch = truncate(
-                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch)
+                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch, sequential_only, FLAGS.use_left_padding)
 
         # Run model.
         output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
@@ -219,13 +219,15 @@ def run(only_forward=False):
     else:
         initial_embeddings = None
 
+    sequential_only = is_sequential_only(FLAGS.model_type)
+
     # Trim dataset, convert token sequences to integer sequences, crop, and
     # pad.
     logger.Log("Preprocessing training data.")
     training_data = util.PreprocessDataset(
         raw_training_data, vocabulary, FLAGS.seq_length, data_manager, eval_mode=False, logger=logger,
         sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-        for_rnn=sequential_only(),
+        for_rnn=sequential_only,
         use_left_padding=FLAGS.use_left_padding)
     training_data_iter = util.MakeTrainingIterator(
         training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano)
@@ -239,7 +241,7 @@ def run(only_forward=False):
             FLAGS.eval_seq_length if FLAGS.eval_seq_length is not None else FLAGS.seq_length,
             data_manager, eval_mode=True, logger=logger,
             sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-            for_rnn=sequential_only(),
+            for_rnn=sequential_only,
             use_left_padding=FLAGS.use_left_padding)
         eval_it = util.MakeEvalIterator(eval_data,
             FLAGS.batch_size, FLAGS.eval_data_limit, bucket_eval=FLAGS.bucket_eval,
@@ -352,7 +354,7 @@ def run(only_forward=False):
     # Do an evaluation-only run.
     if only_forward:
         for index, eval_set in enumerate(eval_iterators):
-            acc = evaluate(model, eval_set, logger, metrics_logger, step, vocabulary)
+            acc = evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary)
     else:
          # Train
         logger.Log("Training.")
@@ -370,7 +372,7 @@ def run(only_forward=False):
 
             if FLAGS.truncate_train_batch:
                 X_batch, transitions_batch = truncate(
-                    X_batch, transitions_batch, num_transitions_batch)
+                    X_batch, transitions_batch, num_transitions_batch, sequential_only, FLAGS.use_left_padding)
 
             total_tokens = num_transitions_batch.ravel().sum()
 
@@ -532,7 +534,7 @@ def run(only_forward=False):
 
             if step > 0 and step % FLAGS.eval_interval_steps == 0:
                 for index, eval_set in enumerate(eval_iterators):
-                    acc = evaluate(model, eval_set, logger, metrics_logger, step)
+                    acc = evaluate(model, eval_set, logger, metrics_logger, step, sequential_only)
                     if FLAGS.ckpt_on_best_dev_error and index == 0 and (1 - acc) < 0.99 * best_dev_error and step > FLAGS.ckpt_step:
                         best_dev_error = 1 - acc
                         logger.Log("Checkpointing with new best dev accuracy of %f" % acc)

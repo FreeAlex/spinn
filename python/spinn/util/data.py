@@ -29,14 +29,14 @@ CORE_VOCABULARY = {PADDING_TOKEN: 0,
 NUM_TRANSITION_TYPES = 2
 
 
-def sequential_only():
-    return FLAGS.model_type == "RNN" or FLAGS.model_type == "CBOW"
+def is_sequential_only(model_type):
+    return model_type == "RNN" or model_type == "CBOW"
 
 
-def truncate(X_batch, transitions_batch, num_transitions_batch):
+def truncate(X_batch, transitions_batch, num_transitions_batch, sequential_only, use_left_padding):
     # Truncate each batch to max length within the batch.
-    X_batch_is_left_padded = (not FLAGS.use_left_padding or sequential_only())
-    transitions_batch_is_left_padded = FLAGS.use_left_padding
+    X_batch_is_left_padded = (not use_left_padding or sequential_only)
+    transitions_batch_is_left_padded = use_left_padding
     max_transitions = np.max(num_transitions_batch)
     seq_length = X_batch.shape[1]
 

@@ -33,7 +33,7 @@ from spinn.data.arithmetic import load_simple_data
 from spinn.data.boolean import load_boolean_data
 from spinn.data.sst import load_sst_data
 from spinn.data.snli import load_snli_data
-from spinn.util.data import SimpleProgressBar, sequential_only, truncate
+from spinn.util.data import SimpleProgressBar, is_sequential_only, truncate
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
@@ -63,7 +63,7 @@ class EnsembleModel(object):
 
 class EnsembleTrainer(object):
     def __init__(self, data_manager, initial_embeddings):
-        super(Ens, self).__init__()
+        super(EnsembleTrainer, self).__init__()
         self.initial_embeddings = initial_embeddings
         self.data_manager = data_manager
         self.vocab_size = initial_embeddings.shape[0]
@@ -100,10 +100,10 @@ class EnsembleTrainer(object):
 
     def build_model(self, args, model_cls):
 
-        initial_embeddings = ?
-        vocab_size = ?
-        use_sentence_pair = ?
-        num_classes = ?
+        initial_embeddings = self.initial_embeddings
+        vocab_size = self.vocab_size
+        use_sentence_pair = self.use_sentence_pair
+        num_classes = self.num_classes
 
         model = model_cls(model_dim=args.model_dim,
             word_embedding_dim=args.word_embedding_dim,
@@ -174,7 +174,8 @@ class EnsembleTrainer(object):
 
         self._add_model(name, args, model, optimizer, trainer, step, best_dev_error)
 
-    def __call__(self, x_batch, transitions_batch, y_batch):
+    def __call__(self, x_batch, transitions_batch, y_batch=None,
+                 use_internal_parser=False, validate_transitions=True):
         outputs = []
         for ensemble_model in self.models:
             model = ensemble_model.model
@@ -188,7 +189,7 @@ class EnsembleTrainer(object):
         return outputs
 
 
-def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
+def evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary=None):
     filename, dataset = eval_set
 
     # Evaluate
@@ -203,7 +204,7 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
         if FLAGS.truncate_eval_batch:
             eval_X_batch, eval_transitions_batch = truncate(
-                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch)
+                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch, sequential_only, FLAGS.use_left_padding)
 
         # Run model.
         output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
@@ -312,16 +313,7 @@ def run(only_forward=False):
     else:
         initial_embeddings = None
 
-    # Trim dataset, convert token sequences to integer sequences, crop, and
-    # pad.
-    logger.Log("Preprocessing training data.")
-    training_data = util.PreprocessDataset(
-        raw_training_data, vocabulary, FLAGS.seq_length, data_manager, eval_mode=False, logger=logger,
-        sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-        for_rnn=sequential_only(),
-        use_left_padding=FLAGS.use_left_padding)
-    training_data_iter = util.MakeTrainingIterator(
-        training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano)
+    sequential_only = is_sequential_only(FLAGS.model_type)
 
     # Preprocess eval sets.
     eval_iterators = []
@@ -332,7 +324,7 @@ def run(only_forward=False):
             FLAGS.eval_seq_length if FLAGS.eval_seq_length is not None else FLAGS.seq_length,
             data_manager, eval_mode=True, logger=logger,
             sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-            for_rnn=sequential_only(),
+            for_rnn=sequential_only,
             use_left_padding=FLAGS.use_left_padding)
         eval_it = util.MakeEvalIterator(eval_data,
             FLAGS.batch_size, FLAGS.eval_data_limit, bucket_eval=FLAGS.bucket_eval,
@@ -344,7 +336,7 @@ def run(only_forward=False):
 
     # Ensemble only supports eval right now.
     for index, eval_set in enumerate(eval_iterators):
-        acc = evaluate(model, eval_set, logger, metrics_logger, step, vocabulary)
+        acc = evaluate(model, eval_set, logger, metrics_logger, step, sequential_only, vocabulary)
 
 
 if __name__ == '__main__':
