@@ -108,8 +108,10 @@ class RLBaseModel(BaseModel):
     def build_reward(self, logits, target):
         if self.rl_reward == "standard": # Zero One Loss.
             rewards = torch.eq(logits.max(1)[1], target).float()
+        elif self.rl_reward == "xent": # Cross Entropy Loss.
+            rewards = torch.cat([F.nll_loss(Variable(ll), Variable(t))
+                for ll, t in zip(logits, target.chunk(target.size(0)))], 0).unsqueeze(1).data
         else:
-            # TODO: Cross Entropy Reward
             raise NotImplementedError
 
         return rewards
@@ -124,7 +126,7 @@ class RLBaseModel(BaseModel):
             policy_outp = self.policy(sentences, transitions)
 
             # Estimate Reward
-            policy_prob = F.sigmoid(policy_outp)
+            policy_prob = policy_outp
 
             # Save MSE Loss using Reward as target
             self.policy_loss = nn.MSELoss()(policy_prob, to_gpu(Variable(rewards, volatile=not self.training)))

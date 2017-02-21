@@ -128,7 +128,7 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
             transition_targets.append([m["t_given"] for m in model.spinn.memories])
 
         if FLAGS.write_eval_report:
-            reporter_args = [pred, target, eval_ids, output.data.numpy()]
+            reporter_args = [pred, target, eval_ids, output.data.cpu().numpy()]
             if hasattr(model, 'transition_loss'):
                 transition_preds_per_example = model.spinn.get_transition_preds_per_example()
                 if model.use_sentence_pair:
@@ -629,7 +629,7 @@ if __name__ == '__main__':
     gflags.DEFINE_boolean("validate_transitions", True,
         "Constrain predicted transitions to ones that give a valid parse tree.")
     gflags.DEFINE_float("embedding_keep_rate", 0.9,
-        "Used for dropout on transformed embeddings.")
+        "Used for dropout on transformed embeddings and in the encoder RNN.")
     gflags.DEFINE_boolean("force_transition_loss", False, "")
     gflags.DEFINE_boolean("use_l2_cost", True, "")
     gflags.DEFINE_boolean("use_difference_feature", True, "")
