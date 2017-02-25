@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from spinn.util.blocks import BaseSentencePairTrainer, Reduce
-from spinn.util.blocks import LSTMState, Embed, MLP, Linear
+from spinn.util.blocks import LSTMState, Embed, MLP, Linear, LSTM
 from spinn.util.blocks import reverse_tensor
 from spinn.util.blocks import bundle, unbundle, to_cpu, to_gpu, treelstm, lstm
 from spinn.util.blocks import get_h, get_c
@@ -217,6 +217,58 @@ class SPINN(nn.Module):
 
         return np.array(preds)
 
+    def t_shift(self, buf, stack, tracking, buf_tops, trackings):
+        """SHIFT: Should dequeue buffer and item to stack."""
+        buf_tops.append(buf.pop())
+        trackings.append(tracking)
+
+    def t_reduce(self, buf, stack, tracking, lefts, rights, trackings):
+        """REDUCE: Should compose top two items of the stack into new item."""
+
+        # The right-most input will be popped first.
+        for reduce_inp in [rights, lefts]:
+            if len(stack) > 0:
+                reduce_inp.append(stack.pop())
+            else:
+                if self.debug:
+                    raise IndexError
+                # If we try to Reduce, but there are less than 2 items on the stack,
+                # then treat any available item as the right input, and use zeros
+                # for any other inputs.
+                # NOTE: Only happens on cropped data.
+                zeros = to_gpu(Variable(
+                    torch.from_numpy(np.zeros(buf[0].size(), dtype=np.float32)),
+                    volatile=buf[0].volatile))
+                reduce_inp.append(zeros)
+
+        trackings.append(tracking)
+
+    def t_skip(self):
+        """SKIP: Acts as padding and is a noop."""
+        pass
+
+    def shift_phase(self, tops, trackings, stacks, idxs):
+        """SHIFT: Should dequeue buffer and item to stack."""
+        if len(stacks) > 0:
+            shift_candidates = iter(tops)
+            for stack in stacks:
+                new_stack_item = next(shift_candidates)
+                stack.append(new_stack_item)
+
+    def reduce_phase(self, lefts, rights, trackings, stacks):
+        if len(stacks) > 0:
+            reduced = iter(self.reduce(
+                lefts, rights, trackings))
+            for stack in stacks:
+                new_stack_item = next(reduced)
+                stack.append(new_stack_item)
+
+    def reduce_phase_hook(self, lefts, rights, trackings, reduce_stacks):
+        pass
+
+    def loss_phase_hook(self):
+        pass
+
     def run(self, inp_transitions, run_internal_parser=False, use_internal_parser=False, validate_transitions=True):
         transition_loss = None
         transition_acc = 0.0
@@ -232,6 +284,9 @@ class SPINN(nn.Module):
 
             # A mask to select all non-SKIP transitions.
             cant_skip = np.array([t != T_SKIP for t in transitions])
+
+            # Remember important details from this time step.
+            self.memory = {}
 
             # Run if:
             # A. We have a tracking component and,
@@ -312,70 +367,59 @@ class SPINN(nn.Module):
                     # (optional) Filter to only non-skipped transitions. When filtering values
                     # that will be backpropagated over, be careful that gradient flow isn't broken.
 
-                    memory = {}
-
                     # Actual transition predictions. Used to measure transition accuracy.
-                    memory["t_preds"] = t_preds
+                    self.memory["t_preds"] = t_preds
 
                     # Distribution of transitions use to calculate transition loss.
-                    memory["t_logits"] = t_logits
+                    self.memory["t_logits"] = t_logits
 
                     # Given transitions.
-                    memory["t_given"] = t_given
+                    self.memory["t_given"] = t_given
 
                     # Record step index.
-                    memory["t_mask"] = t_mask
+                    self.memory["t_mask"] = t_mask
 
-                    # TODO: Write tests to make sure these values look right in the various settings.
+                    # TODO: Write tests to make sure memories look right in the various settings.
 
                     # If this FLAG is set, then use the predicted actions rather than the given.
                     if use_internal_parser:
                         transition_arr = transition_preds.tolist()
 
-                    self.memories.append(memory)
+            # Pre-Action Phase
+            # ================
 
-            # Action Phase
-            # ============
+            # For SHIFT
+            s_stacks, s_tops, s_trackings, s_idxs = [], [], [], []
 
-            lefts, rights, trackings = [], [], []
+            # For REDUCE
+            r_stacks, r_lefts, r_rights, r_trackings = [], [], [], []
+
             batch = zip(transition_arr, self.bufs, self.stacks,
                         self.tracker.states if hasattr(self, 'tracker') and self.tracker.h is not None
                         else itertools.repeat(None))
 
             for batch_idx, (transition, buf, stack, tracking) in enumerate(batch):
                 if transition == T_SHIFT: # shift
-                    stack.append(buf.pop())
+                    self.t_shift(buf, stack, tracking, s_tops, s_trackings)
+                    s_idxs.append(batch_idx)
+                    s_stacks.append(stack)
                 elif transition == T_REDUCE: # reduce
-                    # The right-most input will be popped first.
-                    for reduce_inp in [rights, lefts]:
-                        if len(stack) > 0:
-                            reduce_inp.append(stack.pop())
-                        else:
-                            if self.debug:
-                                raise IndexError
-                            # If we try to Reduce, but there are less than 2 items on the stack,
-                            # then treat any available item as the right input, and use zeros
-                            # for any other inputs.
-                            # NOTE: Only happens on cropped data.
-                            zeros = to_gpu(Variable(
-                                torch.from_numpy(np.zeros(buf[0].size(), dtype=np.float32)),
-                                volatile=buf[0].volatile))
-                            reduce_inp.append(zeros)
+                    self.t_reduce(buf, stack, tracking, r_lefts, r_rights, r_trackings)
+                    r_stacks.append(stack)
+                elif transition == T_SKIP: # skip
+                    self.t_skip()
 
-                    # The tracking output is used in the Reduce function.
-                    trackings.append(tracking)
-
-            # Reduce Phase
+            # Action Phase
             # ============
 
-            if len(rights) > 0:
-                reduced = iter(self.reduce(
-                    lefts, rights, trackings))
-                for transition, stack, in zip(
-                        transition_arr, self.stacks):
-                    if transition == T_REDUCE: # reduce
-                        new_stack_item = next(reduced)
-                        stack.append(new_stack_item)
+            self.shift_phase(s_tops, s_trackings, s_stacks, s_idxs)
+            self.reduce_phase(r_lefts, r_rights, r_trackings, r_stacks)
+            self.reduce_phase_hook(r_lefts, r_rights, r_trackings, r_stacks)
+
+            # Memory Phase
+            # ============
+
+            self.memories.append(self.memory)
 
         # Loss Phase
         # ==========
@@ -389,6 +433,8 @@ class SPINN(nn.Module):
             transition_loss = nn.NLLLoss()(t_logits, to_gpu(Variable(
                 torch.from_numpy(t_given), volatile=t_logits.volatile)))
             transition_loss *= self.transition_weight
+
+        self.loss_phase_hook()
 
         if self.debug:
             assert all(len(stack) == 3 for stack in self.stacks), \
@@ -414,7 +460,7 @@ class BaseModel(nn.Module):
                  classifier_keep_rate=None,
                  tracking_lstm_hidden_dim=4,
                  transition_weight=None,
-                 use_encode=None,
+                 encode_style=None,
                  encode_reverse=None,
                  encode_bidirectional=None,
                  encode_num_layers=None,
@@ -426,6 +472,7 @@ class BaseModel(nn.Module):
                  use_product_feature=False,
                  num_mlp_layers=None,
                  mlp_bn=None,
+                 use_projection=None,
                  **kwargs
                 ):
         super(BaseModel, self).__init__()
@@ -433,22 +480,7 @@ class BaseModel(nn.Module):
         self.use_sentence_pair = use_sentence_pair
         self.use_difference_feature = use_difference_feature
         self.use_product_feature = use_product_feature
-
         self.hidden_dim = hidden_dim = model_dim / 2
-        features_dim = hidden_dim * 2 if use_sentence_pair else hidden_dim
-
-        if self.use_sentence_pair:
-            if self.use_difference_feature:
-                features_dim += self.hidden_dim
-            if self.use_product_feature:
-                features_dim += self.hidden_dim
-
-        mlp_input_dim = features_dim
-
-        self.initial_embeddings = initial_embeddings
-        self.word_embedding_dim = word_embedding_dim
-        self.model_dim = model_dim
-        classifier_dropout_rate = 1. - classifier_keep_rate
 
         args = Args()
         args.lateral_tracking = lateral_tracking
@@ -457,32 +489,71 @@ class BaseModel(nn.Module):
         args.tracker_size = tracking_lstm_hidden_dim
         args.transition_weight = transition_weight
 
+        self.initial_embeddings = initial_embeddings
+        self.word_embedding_dim = word_embedding_dim
+        self.model_dim = model_dim
+        classifier_dropout_rate = 1. - classifier_keep_rate
+
         vocab = Vocab()
         vocab.size = initial_embeddings.shape[0] if initial_embeddings is not None else vocab_size
         vocab.vectors = initial_embeddings
+
+        # Build parsing component.
+        self.spinn = self.build_spinn(args, vocab, use_skips)
+
+        # Build classiifer.
+        features_dim = self.get_features_dim()
+        self.mlp = MLP(features_dim, mlp_dim, num_classes,
+            num_mlp_layers, mlp_bn, classifier_dropout_rate)
 
         # The input embeddings represent the hidden and cell state, so multiply by 2.
         self.embedding_dropout_rate = 1. - embedding_keep_rate
         input_embedding_dim = args.size * 2
 
-        # Create dynamic embedding layer.
-        self.embed = Embed(input_embedding_dim, vocab.size, vectors=vocab.vectors)
+        # Projection will effectively be done by the encoding network.
+        use_projection = True if encode_style is None else False
 
-        self.use_encode = use_encode
-        if use_encode:
-            self.encode_reverse = encode_reverse
-            self.encode_bidirectional = encode_bidirectional
-            self.bi = 2 if self.encode_bidirectional else 1
-            self.encode_num_layers = encode_num_layers
-            self.encode = nn.LSTM(model_dim, model_dim / self.bi, num_layers=encode_num_layers,
-                batch_first=True,
-                bidirectional=self.encode_bidirectional,
+        # Create dynamic embedding layer.
+        self.embed = Embed(input_embedding_dim, vocab.size, vectors=vocab.vectors, use_projection=use_projection)
+
+        # Optionally build input encoder.
+        if encode_style is not None:
+            self.encode = self.build_input_encoder(encode_style=encode_style,
+                word_embedding_dim=word_embedding_dim, model_dim=model_dim,
+                num_layers=encode_num_layers, bidirectional=encode_bidirectional, reverse=encode_reverse,
                 dropout=self.embedding_dropout_rate)
 
-        self.spinn = self.build_spinn(args, vocab, use_skips)
+    def get_features_dim(self):
+        features_dim = self.hidden_dim * 2 if self.use_sentence_pair else self.hidden_dim
+        if self.use_sentence_pair:
+            if self.use_difference_feature:
+                features_dim += self.hidden_dim
+            if self.use_product_feature:
+                features_dim += self.hidden_dim
+        return features_dim
 
-        self.mlp = MLP(mlp_input_dim, mlp_dim, num_classes,
-            num_mlp_layers, mlp_bn, classifier_dropout_rate)
+    def build_features(self, h):
+        if self.use_sentence_pair:
+            h_prem, h_hyp = h
+            features = [h_prem, h_hyp]
+            if self.use_difference_feature:
+                features.append(h_prem - h_hyp)
+            if self.use_product_feature:
+                features.append(h_prem * h_hyp)
+            features = torch.cat(features, 1)
+        else:
+            features = h[0]
+        return features
+
+    def build_input_encoder(self, encode_style="LSTM", word_embedding_dim=None, model_dim=None,
+                            num_layers=None, bidirectional=None, reverse=None, dropout=None):
+        if encode_style == "LSTM":
+            encoding_net = LSTM(word_embedding_dim, model_dim,
+                num_layers=num_layers, bidirectional=bidirectional, reverse=reverse,
+                dropout=dropout)
+        else:
+            raise NotImplementedError
+        return encoding_net
 
     def build_spinn(self, args, vocab, use_skips):
         return SPINN(args, vocab, use_skips=use_skips)
@@ -490,34 +561,15 @@ class BaseModel(nn.Module):
     def build_example(self, sentences, transitions):
         raise Exception('Not implemented.')
 
-    def run_encode(self, x):
-        bi = self.bi
-
-        batch_size, seq_len, model_dim = x.size()
-
-        if self.encode_reverse:
-            x = reverse_tensor(x, dim=1)
-
-        num_layers = self.encode_num_layers
-        h0 = to_gpu(Variable(torch.zeros(num_layers * bi, batch_size, model_dim / bi), volatile=not self.training))
-        c0 = to_gpu(Variable(torch.zeros(num_layers * bi, batch_size, model_dim / bi), volatile=not self.training))
-
-        # Expects (input, h_0, c_0):
-        #   input => seq_len x batch_size x model_dim
-        #   h_0   => (num_layers x bi[1,2]) x batch_size x model_dim
-        #   c_0   => (num_layers x bi[1,2]) x batch_size x model_dim
-        output, (hn, cn) = self.encode(x, (h0, c0))
-
-        if self.encode_reverse:
-            output = reverse_tensor(output, dim=1)
-
-        return output
+    def spinn_hook(self, state):
+        pass
 
     def run_spinn(self, example, use_internal_parser, validate_transitions=True):
         self.spinn.reset_state()
         state, transition_acc, transition_loss = self.spinn(example,
                                use_internal_parser=use_internal_parser,
                                validate_transitions=validate_transitions)
+        self.spinn_hook(state)
         return state, transition_acc, transition_loss
 
     def output_hook(self, output, sentences, transitions, y_batch=None):
@@ -533,9 +585,9 @@ class BaseModel(nn.Module):
         embeds = F.dropout(embeds, self.embedding_dropout_rate, training=self.training)
         embeds = torch.chunk(to_cpu(embeds), b, 0)
 
-        if self.use_encode:
+        if hasattr(self, 'encode'):
             to_encode = torch.cat([e.unsqueeze(0) for e in embeds], 0)
-            encoded = self.run_encode(to_encode)
+            encoded = self.encode(to_encode)
             embeds = [x.squeeze() for x in torch.chunk(encoded, b, 0)]
 
         # Make Buffers
@@ -552,16 +604,7 @@ class BaseModel(nn.Module):
         self.transition_loss = transition_loss
 
         # Build features
-        if self.use_sentence_pair:
-            h_prem, h_hyp = h
-            features = [h_prem, h_hyp]
-            if self.use_difference_feature:
-                features.append(h_prem - h_hyp)
-            if self.use_product_feature:
-                features.append(h_prem * h_hyp)
-            features = torch.cat(features, 1)
-        else:
-            features = h[0]
+        features = self.build_features(h)
 
         output = self.mlp(features)
 

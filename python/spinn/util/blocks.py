@@ -125,6 +125,16 @@ class LSTMState:
         return self._both
 
 
+def get_seq_h(state, hidden_dim):
+    return state[:, :, hidden_dim:]
+
+def get_seq_c(state, hidden_dim):
+    return state[:, :, :hidden_dim]
+
+def get_seq_state(c, h):
+    return torch.cat([h, c], 2)
+
+
 def get_h(state, hidden_dim):
     return state[:, hidden_dim:]
 
@@ -245,18 +255,25 @@ class BaseSentencePairTrainer(object):
 
     def load(self, filename):
         checkpoint = torch.load(filename)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        model_state_dict = checkpoint['model_state_dict']
+
+        # HACK: Compatability for saving supervised SPINN and loading RL SPINN.
+        if 'baseline' in self.model.state_dict().keys() and 'baseline' not in model_state_dict:
+            model_state_dict['baseline'] = torch.FloatTensor([0.0])
+
+        self.model.load_state_dict(model_state_dict)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         return checkpoint['step'], checkpoint['best_dev_error']
 
 
 class Embed(nn.Module):
-    def __init__(self, size, vocab_size, vectors):
+    def __init__(self, size, vocab_size, vectors, use_projection=True):
         super(Embed, self).__init__()
         if vectors is None:
             self.embed = nn.Embedding(vocab_size, size)
         else:
-            self.projection = nn.Linear(vectors.shape[1], size)
+            if use_projection:
+                self.projection = nn.Linear(vectors.shape[1], size)
         self.vectors = vectors
 
     def forward(self, tokens):
@@ -265,9 +282,50 @@ class Embed(nn.Module):
         else:
             embeds = self.vectors.take(tokens.data.cpu().numpy().ravel(), axis=0)
             embeds = to_gpu(Variable(torch.from_numpy(embeds), volatile=tokens.volatile))
-            embeds = self.projection(embeds)
+            if hasattr(self, 'projection'):
+                embeds = self.projection(embeds)
 
         return embeds
+
+
+class LSTM(nn.Module):
+    def __init__(self, inp_dim, model_dim, num_layers=1, reverse=False, bidirectional=False, dropout=None):
+        super(LSTM, self).__init__()
+        self.model_dim = model_dim
+        self.reverse = reverse
+        self.bidirectional = bidirectional
+        self.bi = 2 if self.bidirectional else 1
+        self.num_layers = num_layers
+        self.rnn = nn.LSTM(inp_dim, model_dim / self.bi, num_layers=num_layers,
+            batch_first=True,
+            bidirectional=self.bidirectional,
+            dropout=dropout)
+
+    def forward(self, x, h0=None, c0=None):
+        bi = self.bi
+        num_layers = self.num_layers
+        batch_size, seq_len = x.size()[:2]
+        model_dim = self.model_dim
+
+        if self.reverse:
+            x = reverse_tensor(x, dim=1)
+
+        # Initialize state unless it is given.
+        if h0 is None:
+            h0 = to_gpu(Variable(torch.zeros(num_layers * bi, batch_size, model_dim / bi), volatile=not self.training))
+        if c0 is None:
+            c0 = to_gpu(Variable(torch.zeros(num_layers * bi, batch_size, model_dim / bi), volatile=not self.training))
+
+        # Expects (input, h_0, c_0):
+        #   input => seq_len x batch_size x model_dim
+        #   h_0   => (num_layers x bi[1,2]) x batch_size x model_dim
+        #   c_0   => (num_layers x bi[1,2]) x batch_size x model_dim
+        output, (hn, cn) = self.rnn(x, (h0, c0))
+
+        if self.reverse:
+            output = reverse_tensor(output, dim=1)
+
+        return output
 
 
 class Reduce(nn.Module):
@@ -466,6 +524,7 @@ def PassthroughLSTMInitializer(lstm):
     lstm.bias_hh_l0.data.set_(torch.from_numpy(bhh_init))
     lstm.bias_ih_l0.data.set_(torch.from_numpy(bih_init))
 
+
 def Linear(initializer=DefaultUniformInitializer, bias_initializer=ZeroInitializer):
     class CustomLinear(nn.Linear):
         def reset_parameters(self):
@@ -473,11 +532,3 @@ def Linear(initializer=DefaultUniformInitializer, bias_initializer=ZeroInitializ
             if self.bias is not None:
                 bias_initializer(self.bias)
     return CustomLinear
-
-
-def LSTM(initializer=DefaultUniformInitializer):
-    class CustomLSTM(nn.LSTM):
-        def reset_parameters(self):
-            for weight in self.parameters():
-                initializer(weight)
-    return CustomLSTM

@@ -38,6 +38,8 @@ from spinn.util.data import SimpleProgressBar
 from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
 from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
 
+import spinn.gen_spinn
+import spinn.rae_spinn
 import spinn.rl_spinn
 import spinn.fat_stack
 import spinn.plain_rnn
@@ -252,7 +254,8 @@ def run(only_forward=False):
         for_rnn=sequential_only(),
         use_left_padding=FLAGS.use_left_padding)
     training_data_iter = util.MakeTrainingIterator(
-        training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano)
+        training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano,
+        sentence_pair_data=data_manager.SENTENCE_PAIR_DATA)
 
     # Preprocess eval sets.
     eval_iterators = []
@@ -280,6 +283,10 @@ def run(only_forward=False):
         model_module = spinn.fat_stack
     elif FLAGS.model_type == "RLSPINN":
         model_module = spinn.rl_spinn
+    elif FLAGS.model_type == "RAESPINN":
+        model_module = spinn.rae_spinn
+    elif FLAGS.model_type == "GENSPINN":
+        model_module = spinn.gen_spinn
     else:
         raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
 
@@ -307,7 +314,7 @@ def run(only_forward=False):
          classifier_keep_rate=FLAGS.semantic_classifier_keep_rate,
          tracking_lstm_hidden_dim=FLAGS.tracking_lstm_hidden_dim,
          transition_weight=FLAGS.transition_weight,
-         use_encode=FLAGS.use_encode,
+         encode_style=FLAGS.encode_style,
          encode_reverse=FLAGS.encode_reverse,
          encode_bidirectional=FLAGS.encode_bidirectional,
          encode_num_layers=FLAGS.encode_num_layers,
@@ -323,12 +330,14 @@ def run(only_forward=False):
          rl_baseline=FLAGS.rl_baseline,
          rl_reward=FLAGS.rl_reward,
          rl_weight=FLAGS.rl_weight,
+         predict_leaf=FLAGS.predict_leaf,
+         gen_h=FLAGS.gen_h,
         )
 
     # Build optimizer.
     if FLAGS.optimizer_type == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate, betas=(0.9, 0.999), eps=1e-08)
-    elif FLAGS.optimizer_type == "RMSProp":
+    elif FLAGS.optimizer_type == "RMSprop":
         optimizer = optim.RMSprop(model.parameters(), lr=FLAGS.learning_rate, eps=1e-08)
     else:
         raise NotImplementedError
@@ -426,6 +435,9 @@ def run(only_forward=False):
             transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
             rl_loss = model.rl_loss if hasattr(model, 'rl_loss') else None
             policy_loss = model.policy_loss if hasattr(model, 'policy_loss') else None
+            rae_loss = model.spinn.rae_loss if hasattr(model.spinn, 'rae_loss') else None
+            leaf_loss = model.spinn.leaf_loss if hasattr(model.spinn, 'leaf_loss') else None
+            gen_loss = model.spinn.gen_loss if hasattr(model.spinn, 'gen_loss') else None
 
             # Force Transition Loss Optimization
             if FLAGS.force_transition_loss:
@@ -437,6 +449,14 @@ def run(only_forward=False):
                 truth = [m["t_given"] for m in model.spinn.memories]
                 A.add('preds', preds)
                 A.add('truth', truth)
+
+            # Accumulate stats for leaf prediction accuracy.
+            if leaf_loss is not None:
+                A.add('leaf_acc', model.spinn.leaf_acc)
+
+            # Accumulate stats for word prediction accuracy.
+            if gen_loss is not None:
+                A.add('gen_acc', model.spinn.gen_acc)
 
             # Note: Keep track of transition_acc, although this is a naive average.
             # Should be weighted by length of sequences in batch.
@@ -451,6 +471,9 @@ def run(only_forward=False):
             l2_cost_val = l2_loss.data[0] if l2_loss is not None else 0.0
             rl_cost_val = rl_loss.data[0] if rl_loss is not None else 0.0
             policy_cost_val = policy_loss.data[0] if policy_loss is not None else 0.0
+            rae_cost_val = rae_loss.data[0] if rae_loss is not None else 0.0
+            leaf_cost_val = leaf_loss.data[0] if leaf_loss is not None else 0.0
+            gen_cost_val = gen_loss.data[0] if gen_loss is not None else 0.0
 
             # Accumulate Total Loss Data
             total_cost_val = 0.0
@@ -460,6 +483,9 @@ def run(only_forward=False):
             total_cost_val += l2_cost_val
             total_cost_val += rl_cost_val
             total_cost_val += policy_cost_val
+            total_cost_val += rae_cost_val
+            total_cost_val += leaf_cost_val
+            total_cost_val += gen_cost_val
 
             M.add('total_cost', total_cost_val)
             M.add('xent_cost', xent_cost_val)
@@ -485,6 +511,12 @@ def run(only_forward=False):
                 total_loss += rl_loss
             if policy_loss is not None:
                 total_loss += policy_loss
+            if rae_loss is not None:
+                total_loss += rae_loss
+            if leaf_loss is not None:
+                total_loss += leaf_loss
+            if gen_loss is not None:
+                total_loss += gen_loss
 
             # Useful for debugging gradient flow.
             if FLAGS.debug:
@@ -533,6 +565,14 @@ def run(only_forward=False):
                     avg_trans_acc = (all_preds == all_truth).sum() / float(all_truth.shape[0])
                 else:
                     avg_trans_acc = 0.0
+                if leaf_loss is not None:
+                    avg_leaf_acc = A.get_avg('leaf_acc')
+                else:
+                    avg_leaf_acc = 0.0
+                if gen_loss is not None:
+                    avg_gen_acc = A.get_avg('gen_acc')
+                else:
+                    avg_gen_acc = 0.0
                 time_metric = time_per_token(A.get('total_tokens'), A.get('total_time'))
                 stats_args = {
                     "step": step,
@@ -544,13 +584,36 @@ def run(only_forward=False):
                     "l2_cost": l2_cost_val,
                     "rl_cost": rl_cost_val,
                     "policy_cost": policy_cost_val,
+                    "rae_cost": rae_cost_val,
+                    "leaf_acc": avg_leaf_acc,
+                    "leaf_cost": leaf_cost_val,
+                    "gen_acc": avg_gen_acc,
+                    "gen_cost": gen_cost_val,
                     "time": time_metric,
                 }
-                stats_str = "Step: {step} Acc: {class_acc:.5f} {transition_acc:.5f} Cost: {total_cost:.5f} {xent_cost:.5f} {transition_cost:.5f} {l2_cost:.5f}"
+                stats_str = "Step: {step}"
+
+                # Accuracy Component.
+                stats_str += " Acc: {class_acc:.5f} {transition_acc:.5f}"
+                if leaf_loss is not None:
+                    stats_str += " leaf{leaf_acc:.5f}"
+                if gen_loss is not None:
+                    stats_str += " gen{gen_acc:.5f}"
+
+                # Cost Component.
+                stats_str += " Cost: {total_cost:.5f} {xent_cost:.5f} {transition_cost:.5f} {l2_cost:.5f}"
                 if rl_loss is not None:
                     stats_str += " r{rl_cost:.5f}"
                 if policy_loss is not None:
                     stats_str += " p{policy_cost:.5f}"
+                if rae_loss is not None:
+                    stats_str += " rae{rae_cost:.5f}"
+                if leaf_loss is not None:
+                    stats_str += " leaf{leaf_cost:.5f}"
+                if gen_loss is not None:
+                    stats_str += " gen{gen_cost:.5f}"
+
+                # Time Component.
                 stats_str += " Time: {time:.5f}"
                 logger.Log(stats_str.format(**stats_args))
 
@@ -620,7 +683,7 @@ if __name__ == '__main__':
     gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
 
     # Model architecture settings.
-    gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN"], "")
+    gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN", "RAESPINN", "GENSPINN"], "")
     gflags.DEFINE_integer("gpu", -1, "")
     gflags.DEFINE_integer("model_dim", 8, "")
     gflags.DEFINE_integer("word_embedding_dim", 8, "")
@@ -645,6 +708,7 @@ if __name__ == '__main__':
 
     # Encode settings.
     gflags.DEFINE_boolean("use_encode", False, "Encode embeddings with sequential network.")
+    gflags.DEFINE_enum("encode_style", None, ["LSTM", "CNN", "QRNN"], "Encode embeddings with sequential context.")
     gflags.DEFINE_boolean("encode_reverse", False, "Encode in reverse order.")
     gflags.DEFINE_boolean("encode_bidirectional", False, "Encode in both directions.")
     gflags.DEFINE_integer("encode_num_layers", 1, "RNN layers in encoding net.")
@@ -656,6 +720,12 @@ if __name__ == '__main__':
     gflags.DEFINE_enum("rl_reward", "standard", ["standard", "xent"],
         "Different reward functions to use.")
     gflags.DEFINE_float("rl_weight", 1.0, "Hyperparam for REINFORCE loss.")
+
+    # RAE settings.
+    gflags.DEFINE_boolean("predict_leaf", True, "Predict whether a node is a leaf or not.")
+
+    # GEN settings.
+    gflags.DEFINE_boolean("gen_h", True, "Use generator output as feature.")
 
     # MLP settings.
     gflags.DEFINE_integer("mlp_dim", 1024, "Dimension of intermediate MLP layers.")
@@ -706,5 +776,9 @@ if __name__ == '__main__':
 
     if not FLAGS.sha:
         FLAGS.sha = os.popen('git rev-parse HEAD').read().strip()
+
+    # HACK: The "use_encode" flag will be deprecated. Instead use something like encode_style=LSTM.
+    if FLAGS.use_encode:
+        FLAGS.encode_style = "LSTM"
 
     run(only_forward=FLAGS.expanded_eval_only_mode)
