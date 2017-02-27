@@ -153,10 +153,14 @@ class SPINN(nn.Module):
         if not hasattr(example, 'transitions'):
             # TODO: Support no transitions. In the meantime, must at least pass dummy transitions.
             raise ValueError('Transitions must be included.')
+        self.forward_hook()
         return self.run(example.transitions,
                         run_internal_parser=True,
                         use_internal_parser=use_internal_parser,
                         validate_transitions=validate_transitions)
+
+    def forward_hook(self):
+        pass
 
     def validate(self, transitions, preds, stacks, bufs, zero_padded=True):
         # Note: There is one zero added to bufs, and two zeros added to stacks.
@@ -254,6 +258,8 @@ class SPINN(nn.Module):
             for stack in stacks:
                 new_stack_item = next(shift_candidates)
                 stack.append(new_stack_item)
+    def shift_phase_hook(self, tops, trackings, stacks, idxs):
+        pass
 
     def reduce_phase(self, lefts, rights, trackings, stacks):
         if len(stacks) > 0:
@@ -392,7 +398,7 @@ class SPINN(nn.Module):
             s_stacks, s_tops, s_trackings, s_idxs = [], [], [], []
 
             # For REDUCE
-            r_stacks, r_lefts, r_rights, r_trackings = [], [], [], []
+            r_stacks, r_lefts, r_rights, r_trackings, r_idxs = [], [], [], [], []
 
             batch = zip(transition_arr, self.bufs, self.stacks,
                         self.tracker.states if hasattr(self, 'tracker') and self.tracker.h is not None
@@ -406,6 +412,7 @@ class SPINN(nn.Module):
                 elif transition == T_REDUCE: # reduce
                     self.t_reduce(buf, stack, tracking, r_lefts, r_rights, r_trackings)
                     r_stacks.append(stack)
+                    r_idxs.append(batch_idx)
                 elif transition == T_SKIP: # skip
                     self.t_skip()
 
@@ -413,8 +420,9 @@ class SPINN(nn.Module):
             # ============
 
             self.shift_phase(s_tops, s_trackings, s_stacks, s_idxs)
+            self.shift_phase_hook(s_tops, s_trackings, s_stacks, s_idxs)
             self.reduce_phase(r_lefts, r_rights, r_trackings, r_stacks)
-            self.reduce_phase_hook(r_lefts, r_rights, r_trackings, r_stacks)
+            self.reduce_phase_hook(r_lefts, r_rights, r_trackings, r_stacks, r_idxs=r_idxs)
 
             # Memory Phase
             # ============

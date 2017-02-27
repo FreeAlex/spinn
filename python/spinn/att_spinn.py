@@ -4,30 +4,95 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch import nn
 from spinn.util.misc import Args, Vocab, Example
-from spinn.util.blocks import to_cpu, to_gpu
+from spinn.util.blocks import to_cpu, to_gpu, get_h
 from spinn.util.blocks import Embed, MLP
 from fat_stack import SPINN
+from itertools import izip
 
 class SentencePairTrainer():
     """
     required by the framework, fat_classifier.py @291,295
     init as classifier_trainer at fat_classifier.py @337
     """
-    pass
+    def __init__(self, model, optimizer):
+        print 'attspinn trainer init'
+        self.model = model
+        self.optimizer = optimizer
+
+    def save(self, filename, step, best_dev_error):
+        torch.save({
+            'step': step,
+            'best_dev_error': best_dev_error,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename)
+        model_state_dict = checkpoint['model_state_dict']
+
+        # HACK: Compatability for saving supervised SPINN and loading RL SPINN.
+        if 'baseline' in self.model.state_dict().keys() and 'baseline' not in model_state_dict:
+            model_state_dict['baseline'] = torch.FloatTensor([0.0])
+
+        self.model.load_state_dict(model_state_dict)
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        return checkpoint['step'], checkpoint['best_dev_error']
+
+class SPINNAttExt(SPINN):
+
+    def __init__(self, args, vocab, use_skips):
+        print 'SPINNAttExt init...'
+        super(SPINNAttExt, self).__init__(args, vocab, use_skips)
+        self.hidden_dim = args.size
+        self.states = [] # only support one example now, premise and hypothesis
+
+    def forward_hook(self):
+        batch_size = len(self.bufs)
+        assert batch_size == 2, 'Batch not yet support'
+        self.states = [[]] * batch_size
+
+    def shift_phase_hook(self, tops, trackings, stacks, idxs):
+        # print 'shift_phase_hook...'
+        for idx, stack in izip(idxs, stacks):
+            self.states[idx].append(stack[-1])
+
+    def reduce_phase_hook(self, lefts, rights, trackings, reduce_stacks, r_idxs=None):
+
+        for idx, stack in izip(r_idxs, reduce_stacks):
+            self.states[idx].append(stack[-1])
+
+    def get_hidden_stacks(self):
+        batch_size = len(self.states) / 2
+
+        premise_stacks = self.states[:batch_size]
+        hyphothesis_stacks = self.states[batch_size:]
+
+        return premise_stacks, hyphothesis_stacks
+
+    def get_h_stacks(self):
+        premise_stacks, hypothesis_stacks = self.get_hidden_stacks()
+        # each hc_stack in premise or hypothesis stacks is a stack of states in SPINN shape=(#
+        p_stacks = [get_h(hc_stack, self.hidden_dim) for hc_stack in premise_stacks]
+        h_stacks = [get_h(hc_stack, self.hidden_dim) for hc_stack in hypothesis_stacks]
+
+        return p_stacks, h_stacks
 
 
-class SPINNAttention(nn.module):
 
-    def __init__(self):
-        # default define, TODO
-        pass
+
+class AttentionModel(nn.Module):
+
+    def __init__(self, **kwargs):
+        super(AttentionModel, self).__init__()
+        print 'AttentionModel init'
 
     def forward(self, premise_stack, hypothesis_stack):
 
         pass
 
 
-class SentencePairModel(nn.module):
+class SentencePairModel(nn.Module):
 
     def __init__(self, model_dim=None,
                  word_embedding_dim=None,
@@ -54,7 +119,7 @@ class SentencePairModel(nn.module):
                  **kwargs
                 ):
         super(SentencePairModel, self).__init__()
-
+        print 'ATTSPINN SentencePairModel init...'
         # self.use_sentence_pair = use_sentence_pair
         self.use_difference_feature = use_difference_feature
         self.use_product_feature = use_product_feature
@@ -112,14 +177,14 @@ class SentencePairModel(nn.module):
             num_mlp_layers, mlp_bn, classifier_dropout_rate)
 
     def build_spinn(self, args, vocab, use_skips):
-        return SPINN(args, vocab, use_skips=use_skips)
+        return SPINNAttExt(args, vocab, use_skips=use_skips)
 
     def build_attention(self):
         pass
 
     def build_example(self, sentences, transitions):
         batch_size = sentences.shape[0]
-
+        # sentences: (#batches, #feature, #2)
         # Build Tokens
         x_prem = sentences[:,:,0]
         x_hyp = sentences[:,:,1]
@@ -137,12 +202,15 @@ class SentencePairModel(nn.module):
         return example
 
     def run_spinn(self, example, use_internal_parser, validate_transitions=True):
-        # TODO instead of return the final hidden vector, return the stack
+        # TODO xz. instead of return the final hidden vector, return the stack
         self.spinn.reset_state()
         state, transition_acc, transition_loss = self.spinn(example,
                                use_internal_parser=use_internal_parser,
                                validate_transitions=validate_transitions)
-        return state, transition_acc, transition_loss
+        premise_stack, hypothesis_stack = self.spinn.get_h_stacks()
+
+        #state: a batch of stack [stack_1, ..., stack_n] where n is batch size
+        return premise_stack, hypothesis_stack, transition_acc, transition_loss
 
     def output_hook(self, output, sentences, transitions, y_batch=None):
         pass
@@ -190,7 +258,7 @@ class SentencePairModel(nn.module):
 
 
 
-class SentenceModel(nn.module):
+class SentenceModel(nn.Module):
     """
     required by the framework, fat_classifier.py@296
     init as model at fat_classifier.py@300

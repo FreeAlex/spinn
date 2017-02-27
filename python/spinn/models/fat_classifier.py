@@ -44,6 +44,7 @@ import spinn.rl_spinn
 import spinn.fat_stack
 import spinn.plain_rnn
 import spinn.cbow
+import spinn.att_spinn
 
 # PyTorch
 import torch
@@ -287,6 +288,8 @@ def run(only_forward=False):
         model_module = spinn.rae_spinn
     elif FLAGS.model_type == "GENSPINN":
         model_module = spinn.gen_spinn
+    elif FLAGS.model_type == "ATTSPINN":
+        model_module = spinn.att_spinn
     else:
         raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
 
@@ -683,7 +686,7 @@ if __name__ == '__main__':
     gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
 
     # Model architecture settings.
-    gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN", "RAESPINN", "GENSPINN"], "")
+    gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN", "RAESPINN", "GENSPINN", "ATTSPINN"], "")
     gflags.DEFINE_integer("gpu", -1, "")
     gflags.DEFINE_integer("model_dim", 8, "")
     gflags.DEFINE_integer("word_embedding_dim", 8, "")
