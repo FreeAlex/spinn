@@ -49,25 +49,29 @@ class SPINNAttExt(SPINN):
         super(SPINNAttExt, self).__init__(args, vocab, use_skips)
         self.hidden_dim = args.size
         self.states = [] # only support one example now, premise and hypothesis
+        self.debug = False
 
     def forward_hook(self):
         batch_size = len(self.bufs)
-        assert batch_size == 2, 'Batch not yet support'
-        self.states = [[]] * batch_size
+        self.states = [[] for i in range(batch_size)]
+        # print 'forward hook, clear states'
 
     def shift_phase_hook(self, tops, trackings, stacks, idxs):
         # print 'shift_phase_hook...'
         for idx, stack in izip(idxs, stacks):
-            self.states[idx].append(stack[-1])
+            h = get_h(stack[-1], self.hidden_dim)
+            assert h.size() == torch.Size([1, self.hidden_dim]), 'hsize: {}'.format(h.size())
+            self.states[idx].append(h)
 
     def reduce_phase_hook(self, lefts, rights, trackings, reduce_stacks, r_idxs=None):
 
         for idx, stack in izip(r_idxs, reduce_stacks):
-            self.states[idx].append(stack[-1])
+            h = get_h(stack[-1], self.hidden_dim)
+            assert h.size() == torch.Size([1, self.hidden_dim]), 'hsize: {}'.format(h.size())
+            self.states[idx].append(h)
 
     def get_hidden_stacks(self):
         batch_size = len(self.states) / 2
-
         premise_stacks = self.states[:batch_size]
         hyphothesis_stacks = self.states[batch_size:]
 
@@ -75,11 +79,13 @@ class SPINNAttExt(SPINN):
 
     def get_h_stacks(self):
         premise_stacks, hypothesis_stacks = self.get_hidden_stacks()
-        # each hc_stack in premise or hypothesis stacks is a stack of states in SPINN shape=(#
-        p_stacks = [get_h(hc_stack, self.hidden_dim) for hc_stack in premise_stacks]
-        h_stacks = [get_h(hc_stack, self.hidden_dim) for hc_stack in hypothesis_stacks]
-
-        return p_stacks, h_stacks
+        assert len(premise_stacks) == len(hypothesis_stacks)
+        pstacks = [torch.cat(ps, 0) for ps in premise_stacks]
+        hstacks = [torch.cat(hs, 0) for hs in hypothesis_stacks]
+        if self.debug:
+            print 'pstack size:', [ps.size() for ps in pstacks]
+            print 'hstack size:', [hs.size() for hs in hstacks]
+        return pstacks, hstacks
 
 
 
@@ -109,8 +115,7 @@ class MatchingLSTMCell(RNNCellBase):
         # 4 for c, i, f, o
         self.weight_ih = Parameter(torch.Tensor(4*hidden_size, input_size))
         self.weight_hh = Parameter(torch.Tensor(4*hidden_size, hidden_size))
-        self.bias_ih = Parameter(torch.Tensor(4 * hidden_size))
-
+        self.bias_ih = Parameter(torch.Tensor(4*hidden_size))
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -119,9 +124,8 @@ class MatchingLSTMCell(RNNCellBase):
             weight.data.uniform_(-stdv, stdv)
 
     def forward(self, input, hx, cx):
-        # TODO
-        gates = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(hx, self.weight_hh, None)
-        cgate, igate, fgate, ogate = gates.chunk(4, 1)
+        gates = self.weight_ih.mv(input) + self.weight_hh.mv(hx) + self.bias_ih
+        cgate, igate, fgate, ogate = gates.chunk(4, 0)
         # non linear
         cgate = F.tanh(cgate)
         igate = F.sigmoid(igate)
@@ -130,7 +134,6 @@ class MatchingLSTMCell(RNNCellBase):
 
         cy = (fgate * cx) + (igate * cgate)
         hy = ogate * F.tanh(cy)
-
         return hy, cy
 
 class AttentionModel(nn.Module):
@@ -140,48 +143,45 @@ class AttentionModel(nn.Module):
         self.hidden_dim = args.size #
         self.matching_input_size = args.size * 2
         self.matching_lstm_unit = MatchingLSTMCell(self.matching_input_size, self.hidden_dim)
-        self.w_e = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.w_e = Parameter(torch.Tensor(self.hidden_dim))
         self.weight_premise = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         self.weight_hypothesis = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
-        self.weight_matching = Parameter(torch.Tensor(self.hidden_dim, self.matching_input_size))
+        self.weight_matching = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         print 'AttentionModel init'
+        self.reset_parameters()
 
     def matching_lstm(self, mk, hmk_1, cmk_1):
         hmk, cmk = self.matching_lstm_unit(mk, hmk_1, cmk_1)
         return hmk, cmk
 
-    def attention(self, ps, hk, hmk_1):
+    def attention_vector(self, ps, hk, hmk_1):
         # ak = softmax([... ekj ...]
         # ekj = w^e * tanh(W_pP + W_h*h + W_m*h_m)
-        fe_h = F.linear(hk, self.weight_hypothesis)
-        fe_m = F.linear(hmk_1, self.weight_matching)
         fe_p = F.linear(ps, self.weight_premise)
+        fe_h = self.weight_hypothesis.mv(hk)
+        fe_m = self.weight_matching.mv(hmk_1)
         for i in range(fe_p.size()[0]):
             fe_p[i] = fe_p[i] + fe_h + fe_m
-
-        ak = F.softmax(F.linear(F.tanh(fe_p), self.w_e))
+        ak = F.softmax(F.tanh(fe_p).mv(self.w_e))
         return ak
 
     def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.hidden_size)
+        stdv = 1.0 / math.sqrt(self.hidden_dim)
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
     def run_one_pair(self, ps, hs):
-        batch_size = 1
-        num_layers = 1
-        bidirectional = False
-        bi = 2 if bidirectional else 1
-        hmk_1 = Variable(to_gpu(torch.zeros(num_layers * bi, batch_size, self.hidden_dim)), volatile=not self.training)
-        cmk_1 = Variable(to_gpu(torch.zeros(num_layers * bi, batch_size, self.hidden_dim)), volatile=not self.training)
+
+        hmk_1 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
+        cmk_1 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
+        # print 'hs size', hs.size()
         for hk in hs:
             # for each step
-            ak = self.atention(ps, hk, hmk_1)
-            pmk = F.linear(ps, ak)
+            ak = self.attention_vector(ps, hk, hmk_1)
+            # print 'ak size', ak.size()
+            pmk = ps.t().mv(ak)
             mk = torch.cat([pmk, hk], 0)
-            assert mk.shape == (self.hidden_dim*2)
             hmk_1, cmk_1 = self.matching_lstm(mk, hmk_1, cmk_1)
-
         return hmk_1
 
     def forward(self, premise_stacks, hypothesis_stacks):
@@ -189,10 +189,11 @@ class AttentionModel(nn.Module):
         assert len(premise_stacks) == len(hypothesis_stacks)
 
         hms = []
-
+        # print 'size of stacks', len(premise_stacks)
         for ps, hs in izip(premise_stacks, hypothesis_stacks):
             hm = self.run_one_pair(ps, hs)
-            hms.append(hm)
+            # print 'run one pair complete'
+            hms.append(hm.unsqueeze(0))
 
         hms = torch.cat(hms, 0) # batch it
         return hms
@@ -207,9 +208,9 @@ class SentencePairModel(nn.Module):
                  num_classes=None,
                  mlp_dim=None,
                  embedding_keep_rate=None,
-                 classifier_keep_rate=None,     # TODO mean?
-                 tracking_lstm_hidden_dim=4,    # TODO mean?
-                 transition_weight=None,        # TODO mean?
+                 classifier_keep_rate=None,
+                 tracking_lstm_hidden_dim=4,
+                 transition_weight=None,
                  use_encode=None,
                  encode_reverse=None,
                  encode_bidirectional=None,
@@ -233,7 +234,6 @@ class SentencePairModel(nn.Module):
         self.hidden_dim = hidden_dim = model_dim / 2
         # features_dim = hidden_dim * 2 if use_sentence_pair else hidden_dim
         features_dim = model_dim
-
 
         # [premise, hypothesis, diff, product]
         if self.use_difference_feature:
@@ -278,6 +278,8 @@ class SentencePairModel(nn.Module):
                 dropout=self.embedding_dropout_rate)
 
         self.spinn = self.build_spinn(args, vocab, use_skips)
+
+        self.attention = self.build_attention(args)
 
         self.mlp = MLP(mlp_input_dim, mlp_dim, num_classes,
             num_mlp_layers, mlp_bn, classifier_dropout_rate)
@@ -346,29 +348,36 @@ class SentencePairModel(nn.Module):
         # Premise stack & hypothesis stack
         ps, hs, transition_acc, transition_loss = self.run_spinn(example, use_internal_parser, validate_transitions)
 
-
         self.transition_acc = transition_acc
         self.transition_loss = transition_loss
 
         # attention model
-        h_m = self.attention(ps, hs)    # matching matrix batch_size *
+        h_m = self.attention(ps, hs)    # matching matrix batch_size * hidden_dim
+        assert h_m.size(1) == self.hidden_dim
+        # print 'run attention complete'
 
         features = self.build_features(hs, h_m)
-
 
         # output layer
         output = self.mlp(features)
 
         self.output_hook(output, sentences, transitions, y_batch)
-
+        # print 'one batch complete, output size', output.size()
         return output
 
     def build_features(self, hstacks, h_m):
-
-        h_ks = [ stack[-1] for stack in hstacks]
+        h_ks = [stack[-1].unsqueeze(0) for stack in hstacks]
         h_ks = torch.cat(h_ks, 0) # extract the final representation from each stack
+        assert h_ks.size(0) == h_m.size(0)
+        assert h_ks.size(1) == self.hidden_dim
+        assert h_m.size(1) == self.hidden_dim
 
-        features = torch.cat(h_ks, h_m, 1) # D0 -> batch, D1 -> representation vector
+        features = [h_ks, h_m]
+        if self.use_difference_feature:
+            features.append(h_ks - h_m)
+        if self.use_product_feature:
+            features.append(h_ks * h_m)
+        features = torch.cat(features, 1) # D0 -> batch, D1 -> representation vector
         return features
 
 
