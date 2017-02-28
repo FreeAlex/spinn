@@ -3,11 +3,14 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch import nn
+from torch.nn.modules.rnn import RNNCellBase
+from torch.nn.parameter import Parameter
 from spinn.util.misc import Args, Vocab, Example
 from spinn.util.blocks import to_cpu, to_gpu, get_h
 from spinn.util.blocks import Embed, MLP
 from fat_stack import SPINN
 from itertools import izip
+import math
 
 class SentencePairTrainer():
     """
@@ -80,16 +83,119 @@ class SPINNAttExt(SPINN):
 
 
 
+class MatchingLSTMCell(RNNCellBase):
+    # TODO: xz. modify this description, this is copied from LSTMCell
+    r"""A long short-term memory (LSTM) cell.
+    .. math::
+        \begin{array}{ll}
+        i = sigmoid(W_{mi} x + b_{ii} + W_{hi} h + b_{hi}) \\
+        f = sigmoid(W_{if} x + b_{if} + W_{hf} h + b_{hf}) \\
+        g = \tanh(W_{ig} x + b_{ig} + W_{hc} h + b_{hg}) \\
+        o = sigmoid(W_{io} x + b_{io} + W_{ho} h + b_{ho}) \\
+        c' = f * c + i * g \\
+        h' = o * \tanh(c_t) \\
+        \end{array}
+
+    Args:
+        input_size: The number of expected features in the input x
+        hidden_size: The number of features in the hidden state h
+        bias: If `False`, then the layer does not use bias weights `b_ih` and `b_hh`. Default: True
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super(MatchingLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        # 4 for c, i, f, o
+        self.weight_ih = Parameter(torch.Tensor(4*hidden_size, input_size))
+        self.weight_hh = Parameter(torch.Tensor(4*hidden_size, hidden_size))
+        self.bias_ih = Parameter(torch.Tensor(4 * hidden_size))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, hx, cx):
+        # TODO
+        gates = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(hx, self.weight_hh, None)
+        cgate, igate, fgate, ogate = gates.chunk(4, 1)
+        # non linear
+        cgate = F.tanh(cgate)
+        igate = F.sigmoid(igate)
+        fgate = F.sigmoid(fgate)
+        ogate = F.sigmoid(ogate)
+
+        cy = (fgate * cx) + (igate * cgate)
+        hy = ogate * F.tanh(cy)
+
+        return hy, cy
 
 class AttentionModel(nn.Module):
 
-    def __init__(self, **kwargs):
+    def __init__(self, args):
         super(AttentionModel, self).__init__()
+        self.hidden_dim = args.size #
+        self.matching_input_size = args.size * 2
+        self.matching_lstm_unit = MatchingLSTMCell(self.matching_input_size, self.hidden_dim)
+        self.w_e = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.weight_premise = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.weight_hypothesis = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.weight_matching = Parameter(torch.Tensor(self.hidden_dim, self.matching_input_size))
         print 'AttentionModel init'
 
-    def forward(self, premise_stack, hypothesis_stack):
+    def matching_lstm(self, mk, hmk_1, cmk_1):
+        hmk, cmk = self.matching_lstm_unit(mk, hmk_1, cmk_1)
+        return hmk, cmk
 
-        pass
+    def attention(self, ps, hk, hmk_1):
+        # ak = softmax([... ekj ...]
+        # ekj = w^e * tanh(W_pP + W_h*h + W_m*h_m)
+        fe_h = F.linear(hk, self.weight_hypothesis)
+        fe_m = F.linear(hmk_1, self.weight_matching)
+        fe_p = F.linear(ps, self.weight_premise)
+        for i in range(fe_p.size()[0]):
+            fe_p[i] = fe_p[i] + fe_h + fe_m
+
+        ak = F.softmax(F.linear(F.tanh(fe_p), self.w_e))
+        return ak
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+    def run_one_pair(self, ps, hs):
+        batch_size = 1
+        num_layers = 1
+        bidirectional = False
+        bi = 2 if bidirectional else 1
+        hmk_1 = Variable(to_gpu(torch.zeros(num_layers * bi, batch_size, self.hidden_dim)), volatile=not self.training)
+        cmk_1 = Variable(to_gpu(torch.zeros(num_layers * bi, batch_size, self.hidden_dim)), volatile=not self.training)
+        for hk in hs:
+            # for each step
+            ak = self.atention(ps, hk, hmk_1)
+            pmk = F.linear(ps, ak)
+            mk = torch.cat([pmk, hk], 0)
+            assert mk.shape == (self.hidden_dim*2)
+            hmk_1, cmk_1 = self.matching_lstm(mk, hmk_1, cmk_1)
+
+        return hmk_1
+
+    def forward(self, premise_stacks, hypothesis_stacks):
+
+        assert len(premise_stacks) == len(hypothesis_stacks)
+
+        hms = []
+
+        for ps, hs in izip(premise_stacks, hypothesis_stacks):
+            hm = self.run_one_pair(ps, hs)
+            hms.append(hm)
+
+        hms = torch.cat(hms, 0) # batch it
+        return hms
 
 
 class SentencePairModel(nn.Module):
@@ -179,8 +285,8 @@ class SentencePairModel(nn.Module):
     def build_spinn(self, args, vocab, use_skips):
         return SPINNAttExt(args, vocab, use_skips=use_skips)
 
-    def build_attention(self):
-        pass
+    def build_attention(self, args):
+        return AttentionModel(args)
 
     def build_example(self, sentences, transitions):
         batch_size = sentences.shape[0]
@@ -245,8 +351,9 @@ class SentencePairModel(nn.Module):
         self.transition_loss = transition_loss
 
         # attention model
-        h_m = self.attention(ps, hs)    # matching vector
-        features = np.concat(hs[0], h_m)
+        h_m = self.attention(ps, hs)    # matching matrix batch_size *
+
+        features = self.build_features(hs, h_m)
 
 
         # output layer
@@ -255,6 +362,14 @@ class SentencePairModel(nn.Module):
         self.output_hook(output, sentences, transitions, y_batch)
 
         return output
+
+    def build_features(self, hstacks, h_m):
+
+        h_ks = [ stack[-1] for stack in hstacks]
+        h_ks = torch.cat(h_ks, 0) # extract the final representation from each stack
+
+        features = torch.cat(h_ks, h_m, 1) # D0 -> batch, D1 -> representation vector
+        return features
 
 
 
