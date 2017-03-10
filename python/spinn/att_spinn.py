@@ -143,12 +143,12 @@ class AttentionModel(nn.Module):
         self.hidden_dim = args.size #
         self.matching_input_size = self.hidden_dim * 2
         # matching LSTM
-        self.matching_lstm_unit = to_gpu(LSTMCell(self.matching_input_size, self.hidden_dim))
+        self.matching_lstm_unit = LSTMCell(to_gpu(self.matching_input_size, self.hidden_dim))
         # attention model
-        self.w_e = to_gpu(Parameter(torch.Tensor(self.hidden_dim)))
-        self.weight_premise = to_gpu(Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim)))
-        self.weight_hypothesis = to_gpu(Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim)))
-        self.weight_matching = to_gpu(Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim)))
+        self.w_e = Parameter(to_gpu(torch.Tensor(self.hidden_dim)))
+        self.weight_premise = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
+        self.weight_hypothesis = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
+        self.weight_matching = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
         print 'AttentionModel init'
         self.reset_parameters()
 
