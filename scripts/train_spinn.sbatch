@@ -14,6 +14,7 @@ echo $SLURM_JOBID - `hostname` - $SPINN_FLAGS >> ~/spinn_machine_assignments.txt
 module load python/intel/2.7.12 pytorch/intel/20170125 protobuf/intel/3.1.0
 
 # Run.
+export PYTHONPATH=$PYTHONPATH:../python
 python -m spinn.models.fat_classifier  --noshow_progress_bar --gpu 0 $SPINN_FLAGS
 
 
