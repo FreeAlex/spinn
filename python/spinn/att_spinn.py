@@ -143,7 +143,7 @@ class AttentionModel(nn.Module):
         self.hidden_dim = args.size #
         self.matching_input_size = self.hidden_dim * 2
         # matching LSTM
-        self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim)
+        self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim, bias=True)
         # attention model
         self.w_e = Parameter(to_gpu(torch.Tensor(self.hidden_dim)))
         self.weight_premise = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
