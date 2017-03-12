@@ -144,11 +144,11 @@ class AttentionModel(nn.Module):
         self.matching_input_size = self.hidden_dim * 2
         # matching LSTM
         self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim, bias=True)
-        # attention model
-        self.w_e = Parameter(to_gpu(torch.Tensor(self.hidden_dim)))
-        self.weight_premise = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
-        self.weight_hypothesis = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
-        self.weight_matching = Parameter(to_gpu(torch.Tensor(self.hidden_dim, self.hidden_dim)))
+        # attention model, no need to explicitly move parameters to gpu, it is done in fat_classifier.py
+        self.w_e = Parameter(torch.Tensor(self.hidden_dim))
+        self.weight_premise = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.weight_hypothesis = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
+        self.weight_matching = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         print 'AttentionModel init'
         self.reset_parameters()
 
@@ -193,10 +193,11 @@ class AttentionModel(nn.Module):
         batch_size = len(hypothesis_stacks)
         sentence_lens = [len(hs) for hs in hypothesis_stacks]
         count = [0] * batch_size
+        # compute the maximum number of steps
         num_steps = np.amax(sentence_lens)
         hmk_0 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
         cmk_0 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
-        hmk_buffer = [hmk_0] * batch_size
+        hmk_buffer = [hmk_0] * batch_size   # make copy for each element
         cmk_buffer = [cmk_0] * batch_size
         for stepi in range(num_steps):
             pstack = []
