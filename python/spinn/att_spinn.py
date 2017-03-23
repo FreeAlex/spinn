@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch import nn
-from torch.nn.modules.rnn import RNNCellBase
+from torch.nn.modules.rnn import RNNCellBase, LSTMCell
 from torch.nn.parameter import Parameter
 from spinn.util.misc import Args, Vocab, Example
 from spinn.util.blocks import to_cpu, to_gpu, get_h
@@ -141,8 +141,10 @@ class AttentionModel(nn.Module):
     def __init__(self, args):
         super(AttentionModel, self).__init__()
         self.hidden_dim = args.size #
-        self.matching_input_size = args.size * 2
-        self.matching_lstm_unit = MatchingLSTMCell(self.matching_input_size, self.hidden_dim)
+        self.matching_input_size = self.hidden_dim * 2
+        # matching LSTM
+        self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim, bias=True)
+        # attention model, no need to explicitly move parameters to gpu, it is done in fat_classifier.py
         self.w_e = Parameter(torch.Tensor(self.hidden_dim))
         self.weight_premise = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         self.weight_hypothesis = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
@@ -150,53 +152,91 @@ class AttentionModel(nn.Module):
         print 'AttentionModel init'
         self.reset_parameters()
 
-    def matching_lstm(self, mk, hmk_1, cmk_1):
-        hmk, cmk = self.matching_lstm_unit(mk, hmk_1, cmk_1)
-        return hmk, cmk
+    def matching_lstm(self, mk, hmkx, cmkx):
+        hmky, cmky = self.matching_lstm_unit(mk, (hmkx, cmkx))
+        return hmky, cmky
 
-    def attention_vector(self, ps, hk, hmk_1):
+    def attention_vector(self, pstacks, hks, hmk_x):
         # ak = softmax([... ekj ...]
-        # ekj = w^e * tanh(W_pP + W_h*h + W_m*h_m)
-        fe_p = F.linear(ps, self.weight_premise)
-        fe_h = self.weight_hypothesis.mv(hk)
-        fe_m = self.weight_matching.mv(hmk_1)
-        for i in range(fe_p.size()[0]):
-            fe_p[i] = fe_p[i] + fe_h + fe_m
-        ak = F.softmax(F.tanh(fe_p).mv(self.w_e))
-        return ak
+        # ekj = w^e * tanh(W_pP + Wh*h_k + Wm*h_m)
+        batch_size = hks.size(0)
+        assert batch_size == hmk_x.size(0) and batch_size == len(pstacks), '{},{},{}'.format(hmk_x.size(), len(pstacks), batch_size)
+
+        # compute Wh*h_k and Wm*hm_k
+        fe_h = F.linear(hks, self.weight_hypothesis)
+        fe_m = F.linear(hmk_x, self.weight_matching)
+        assert fe_h.size() == (batch_size, self.hidden_dim)
+        assert fe_m.size() == (batch_size, self.hidden_dim)
+
+        aks = []
+        for i, ps in enumerate(pstacks):
+            fe_hi = torch.stack([fe_h[i]] * ps.size(0), 0)
+            fe_mi = torch.stack([fe_m[i]] * ps.size(0), 0)
+            fe_pi = F.linear(ps, self.weight_premise)
+            ek = F.tanh(fe_pi + fe_hi + fe_mi).mv(self.w_e)
+            ak = ps.t().mv(ek)
+            assert ak.size() == (self.hidden_dim,)
+            assert len(aks) == i
+            aks.append(ak)
+
+        aks = torch.stack(aks, 0)
+        return aks
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_dim)
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def run_one_pair(self, ps, hs):
-
-        hmk_1 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
-        cmk_1 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
-        # print 'hs size', hs.size()
-        for hk in hs:
-            # for each step
-            ak = self.attention_vector(ps, hk, hmk_1)
-            # print 'ak size', ak.size()
-            pmk = ps.t().mv(ak)
-            mk = torch.cat([pmk, hk], 0)
-            hmk_1, cmk_1 = self.matching_lstm(mk, hmk_1, cmk_1)
-        return hmk_1
-
     def forward(self, premise_stacks, hypothesis_stacks):
-
+        # return batch of matching hidden vectors
         assert len(premise_stacks) == len(hypothesis_stacks)
+        batch_size = len(hypothesis_stacks)
+        sentence_lens = [len(hs) for hs in hypothesis_stacks]
+        count = [0] * batch_size
+        # compute the maximum number of steps
+        num_steps = np.amax(sentence_lens)
+        hmk_0 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
+        cmk_0 = Variable(to_gpu(torch.zeros(self.hidden_dim)), volatile=not self.training)
+        hmk_buffer = [hmk_0] * batch_size   # make copy for each element
+        cmk_buffer = [cmk_0] * batch_size
+        for stepi in range(num_steps):
+            pstack = []
+            hks = []
+            hmk_x = []
+            cmk_x = []
+            indexes = []
+            for i in range(batch_size):
+                j = stepi - (num_steps - sentence_lens[i])
+                if j >= 0:
+                    hk = hypothesis_stacks[i][j]
+                    assert hk.size() == (self.hidden_dim, ), hk.size()
+                    hks.append(hk)
+                    hmk_x.append(hmk_buffer[i])
+                    cmk_x.append(cmk_buffer[i])
+                    indexes.append(i)
+                    pstack.append(premise_stacks[i])
 
-        hms = []
-        # print 'size of stacks', len(premise_stacks)
-        for ps, hs in izip(premise_stacks, hypothesis_stacks):
-            hm = self.run_one_pair(ps, hs)
-            # print 'run one pair complete'
-            hms.append(hm.unsqueeze(0))
+            mbatch_size = len(indexes)
+            assert mbatch_size > 0
+            hks = torch.stack(hks, 0)
+            hmk_x = torch.stack(hmk_x, 0)
+            cmk_x = torch.stack(cmk_x, 0)
 
-        hms = torch.cat(hms, 0) # batch it
-        return hms
+            assert hks.size() == (mbatch_size, self.hidden_dim)
+            assert hmk_x.size() == (mbatch_size, self.hidden_dim)
+            assert cmk_x.size() == (mbatch_size, self.hidden_dim)
+
+            aks = self.attention_vector(pstack, hks, hmk_x)
+            assert aks.size(1) == self.hidden_dim
+            mks = torch.cat([aks, hks], 1)
+            hmk_x, cmk_x = self.matching_lstm(mks, hmk_x, cmk_x)
+            for i, index in enumerate(indexes):
+                hmk_buffer[index] = hmk_x[i]
+                cmk_buffer[index] = cmk_x[i]
+                count[index] += 1
+        hmk_final = torch.stack(hmk_buffer)
+        assert count == sentence_lens
+        return hmk_final
 
 
 class SentencePairModel(nn.Module):
@@ -246,7 +286,7 @@ class SentencePairModel(nn.Module):
         self.initial_embeddings = initial_embeddings
         self.word_embedding_dim = word_embedding_dim
         self.model_dim = model_dim
-        classifier_dropout_rate = 1. - classifier_keep_rate # TODO mean?
+        classifier_dropout_rate = 1. - classifier_keep_rate
 
         args = Args()
         args.lateral_tracking = lateral_tracking

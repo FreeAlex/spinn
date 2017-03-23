@@ -6,7 +6,7 @@
 bat=${1:-../scripts/train_spinn.sbatch}
 
 jobID=
-for((i=0; i<7; i++)); do
+for((i=0; i<5; i++)); do
     if [ "$jobID" == "" ]; then
         jobID=$(sbatch -o ~/logs/slurm-%j.out -e ~/logs/slurm-%j.err $bat | awk '{print $NF}')
     else
