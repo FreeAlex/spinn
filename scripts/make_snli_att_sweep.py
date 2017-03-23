@@ -10,7 +10,7 @@ import sys
 
 NYU_NON_PBS = False
 NAME = "ENC"
-SWEEP_RUNS = 2
+SWEEP_RUNS = 1
 
 LIN = "LIN"
 EXP = "EXP"
@@ -49,7 +49,7 @@ FIXED_PARAMETERS = {
     "eval_seq_length":  "150",
     "eval_interval_steps": "1000",
     "statistics_interval_steps": "1000",
-    "nouse_internal_parser": "",    # use gold parser
+    # "use_internal_parser": "",    # use gold parser
     "batch_size":  "64",
     # "use_encode": "",
     # "encode_reverse": "",
@@ -64,8 +64,8 @@ SWEEP_PARAMETERS = {
     "semantic_classifier_keep_rate": ("skr", LIN, 0.7, 0.95),  # NB: Keep rates may depend considerably on dims.
     "embedding_keep_rate": ("ekr", LIN, 0.7, 0.95),
     "learning_rate_decay_per_10k_steps": ("dec", EXP, 0.5, 1.0),
-    "tracking_lstm_hidden_dim": ("tdim", EXP, 24, 128),
-    "transition_weight":  ("trwt", EXP, 0.5, 4.0),
+    # "tracking_lstm_hidden_dim": ("tdim", EXP, 24, 128),
+    # "transition_weight":  ("trwt", EXP, 0.5, 4.0),
 }
 
 sweep_name = "sweep_" + NAME + "_" + \
