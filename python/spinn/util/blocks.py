@@ -9,6 +9,8 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
+from spinn.util.misc import recursively_set_device
+
 
 def debug_gradient(model, losses):
     model.zero_grad()
@@ -239,19 +241,28 @@ def treelstm(c_left, c_right, gates, use_dropout=False, training=None):
     return (c_t, h_t)
 
 
-class BaseSentencePairTrainer(object):
+class ModelTrainer(object):
 
     def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
 
     def save(self, filename, step, best_dev_error):
+        if the_gpu() >= 0:
+            recursively_set_device(self.model.state_dict(), gpu=-1)
+            recursively_set_device(self.optimizer.state_dict(), gpu=-1)
+
+        # Always sends Tensors to CPU.
         torch.save({
             'step': step,
             'best_dev_error': best_dev_error,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
         }, filename)
+
+        if the_gpu() >= 0:
+            recursively_set_device(self.model.state_dict(), gpu=the_gpu())
+            recursively_set_device(self.optimizer.state_dict(), gpu=the_gpu())
 
     def load(self, filename):
         checkpoint = torch.load(filename)

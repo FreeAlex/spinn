@@ -11,34 +11,53 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
-from spinn.util.blocks import BaseSentencePairTrainer, Reduce
+from spinn.util.blocks import Reduce
 from spinn.util.blocks import LSTMState, Embed, MLP
 from spinn.util.blocks import bundle, unbundle, to_cpu, to_gpu, treelstm, lstm
 from spinn.util.blocks import get_h, get_c
 from spinn.util.misc import Args, Vocab, Example
 
-from spinn.fat_stack import BaseModel, SentenceModel, SentencePairModel
+from spinn.fat_stack import BaseModel as _BaseModel
 from spinn.fat_stack import SPINN
 
-
-import spinn.cbow
-
-
-T_SKIP   = 2
-T_SHIFT  = 0
-T_REDUCE = 1
+from spinn.data import T_SHIFT, T_REDUCE, T_SKIP, T_STRUCT
 
 
-class SentencePairTrainer(BaseSentencePairTrainer): pass
+def build_model(data_manager, initial_embeddings, vocab_size, num_classes, FLAGS):
+    model_cls = BaseModel
+    use_sentence_pair = data_manager.SENTENCE_PAIR_DATA
 
-
-class SentenceTrainer(SentencePairTrainer): pass
+    return model_cls(model_dim=FLAGS.model_dim,
+         word_embedding_dim=FLAGS.word_embedding_dim,
+         vocab_size=vocab_size,
+         initial_embeddings=initial_embeddings,
+         num_classes=num_classes,
+         mlp_dim=FLAGS.mlp_dim,
+         embedding_keep_rate=FLAGS.embedding_keep_rate,
+         classifier_keep_rate=FLAGS.semantic_classifier_keep_rate,
+         tracking_lstm_hidden_dim=FLAGS.tracking_lstm_hidden_dim,
+         transition_weight=FLAGS.transition_weight,
+         encode_style=FLAGS.encode_style,
+         encode_reverse=FLAGS.encode_reverse,
+         encode_bidirectional=FLAGS.encode_bidirectional,
+         encode_num_layers=FLAGS.encode_num_layers,
+         use_sentence_pair=use_sentence_pair,
+         lateral_tracking=FLAGS.lateral_tracking,
+         use_tracking_in_composition=FLAGS.use_tracking_in_composition,
+         predict_use_cell=FLAGS.predict_use_cell,
+         use_lengths=FLAGS.use_lengths,
+         use_difference_feature=FLAGS.use_difference_feature,
+         use_product_feature=FLAGS.use_product_feature,
+         num_mlp_layers=FLAGS.num_mlp_layers,
+         mlp_bn=FLAGS.mlp_bn,
+         predict_leaf=FLAGS.predict_leaf,
+        )
 
 
 class RAESPINN(SPINN):
 
-    def __init__(self, args, vocab, use_skips=False, predict_leaf=None):
-        super(RAESPINN, self).__init__(args, vocab, use_skips=use_skips)
+    def __init__(self, args, vocab, predict_use_cell, use_lengths, predict_leaf):
+        super(RAESPINN, self).__init__(args, vocab, predict_use_cell, use_lengths)
         model_dim = args.size * 2
         self.decompose = nn.Linear(model_dim, model_dim * 2)
 
@@ -113,65 +132,11 @@ class RAESPINN(SPINN):
                 self.leaf_phase(leaf_inp, leaf_target)
 
 
-class RAEBaseModel(BaseModel):
+class BaseModel(_BaseModel):
 
     def __init__(self, predict_leaf=None, **kwargs):
         self.predict_leaf = predict_leaf
-        super(RAEBaseModel, self).__init__(**kwargs)
+        super(BaseModel, self).__init__(**kwargs)
 
-    def build_spinn(self, args, vocab, use_skips):
-        return RAESPINN(args, vocab, use_skips=use_skips, predict_leaf=self.predict_leaf)
-
-
-class SentencePairModel(RAEBaseModel):
-
-    def build_example(self, sentences, transitions):
-        batch_size = sentences.shape[0]
-
-        # Build Tokens
-        x_prem = sentences[:,:,0]
-        x_hyp = sentences[:,:,1]
-        x = np.concatenate([x_prem, x_hyp], axis=0)
-
-        # Build Transitions
-        t_prem = transitions[:,:,0]
-        t_hyp = transitions[:,:,1]
-        t = np.concatenate([t_prem, t_hyp], axis=0)
-
-        example = Example()
-        example.tokens = to_gpu(Variable(torch.from_numpy(x), volatile=not self.training))
-        example.transitions = t
-
-        return example
-
-    def run_spinn(self, example, use_internal_parser=False, validate_transitions=True):
-        state_both, transition_acc, transition_loss = super(SentencePairModel, self).run_spinn(
-            example, use_internal_parser, validate_transitions)
-        batch_size = len(state_both) / 2
-        h_premise = get_h(torch.cat(state_both[:batch_size], 0), self.hidden_dim)
-        h_hypothesis = get_h(torch.cat(state_both[batch_size:], 0), self.hidden_dim)
-        return [h_premise, h_hypothesis], transition_acc, transition_loss
-
-
-class SentenceModel(RAEBaseModel):
-
-    def build_example(self, sentences, transitions):
-        batch_size = sentences.shape[0]
-
-        # Build Tokens
-        x = sentences
-
-        # Build Transitions
-        t = transitions
-
-        example = Example()
-        example.tokens = to_gpu(Variable(torch.from_numpy(x), volatile=not self.training))
-        example.transitions = t
-
-        return example
-
-    def run_spinn(self, example, use_internal_parser=False, validate_transitions=True):
-        state, transition_acc, transition_loss = super(SentenceModel, self).run_spinn(
-            example, use_internal_parser, validate_transitions)
-        h = get_h(torch.cat(state, 0), self.hidden_dim)
-        return [h], transition_acc, transition_loss
+    def build_spinn(self, args, vocab, predict_use_cell, use_lengths):
+        return RAESPINN(args, vocab, predict_use_cell, use_lengths, self.predict_leaf)

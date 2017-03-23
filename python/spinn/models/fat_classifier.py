@@ -20,6 +20,8 @@ Note: If you get an error starting with "TypeError: ('Wrong number of dimensions
 """
 
 import os
+import math
+import random
 import pprint
 import sys
 import time
@@ -28,15 +30,23 @@ from collections import deque
 import gflags
 import numpy as np
 
-from spinn import afs_safe_logger
 from spinn import util
+from spinn.util import afs_safe_logger
+from spinn.data.arithmetic import load_sign_data
 from spinn.data.arithmetic import load_simple_data
+from spinn.data.dual_arithmetic import load_eq_data
+from spinn.data.dual_arithmetic import load_relational_data
 from spinn.data.boolean import load_boolean_data
-from spinn.data.sst import load_sst_data
+from spinn.data.listops import load_listops_data
+from spinn.data.sst import load_sst_data, load_sst_binary_data
 from spinn.data.snli import load_snli_data
 from spinn.util.data import SimpleProgressBar
-from spinn.util.blocks import the_gpu, to_gpu, l2_cost, flatten, debug_gradient
-from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalReporter
+from spinn.util.blocks import ModelTrainer, the_gpu, to_gpu, l2_cost, flatten, debug_gradient
+from spinn.util.misc import Accumulator, MetricsLogger, EvalReporter, time_per_token
+from spinn.util.misc import recursively_set_device
+from spinn.util.logging import train_format, train_extra_format, train_stats, train_accumulate
+from spinn.util.loss import auxiliary_loss
+import spinn.util.evalb as evalb
 
 import spinn.gen_spinn
 import spinn.rae_spinn
@@ -53,35 +63,13 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
+from spinn.models.base import sequential_only, get_batch, truncate
+
 
 FLAGS = gflags.FLAGS
 
 
-def sequential_only():
-    return FLAGS.model_type == "RNN" or FLAGS.model_type == "CBOW"
-
-
-def truncate(X_batch, transitions_batch, num_transitions_batch):
-    # Truncate each batch to max length within the batch.
-    X_batch_is_left_padded = (not FLAGS.use_left_padding or sequential_only())
-    transitions_batch_is_left_padded = FLAGS.use_left_padding
-    max_transitions = np.max(num_transitions_batch)
-    seq_length = X_batch.shape[1]
-
-    if X_batch_is_left_padded:
-        X_batch = X_batch[:, seq_length - max_transitions:]
-    else:
-        X_batch = X_batch[:, :max_transitions]
-
-    if transitions_batch_is_left_padded:
-        transitions_batch = transitions_batch[:, seq_length - max_transitions:]
-    else:
-        transitions_batch = transitions_batch[:, :max_transitions]
-
-    return X_batch, transitions_batch
-
-
-def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
+def evaluate(model, eval_set, logger, step, vocabulary=None):
     filename, dataset = eval_set
 
     reporter = EvalReporter()
@@ -99,11 +87,10 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
 
     transition_preds = []
     transition_targets = []
+    transition_examples = []
 
-    for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
-        if FLAGS.truncate_eval_batch:
-            eval_X_batch, eval_transitions_batch = truncate(
-                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch)
+    for i, batch in enumerate(dataset):
+        eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids = get_batch(batch)
 
         # Run model.
         output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
@@ -123,25 +110,36 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
         transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
 
         # Update Aggregate Accuracies
-        total_tokens += eval_num_transitions_batch.ravel().sum()
+        total_tokens += sum([(nt+1)/2 for nt in eval_num_transitions_batch.reshape(-1)])
 
         # Accumulate stats for transition accuracy.
         if transition_loss is not None:
             transition_preds.append([m["t_preds"] for m in model.spinn.memories])
             transition_targets.append([m["t_given"] for m in model.spinn.memories])
 
+        if FLAGS.evalb or FLAGS.num_samples > 0:
+            transitions_per_example = model.spinn.get_transitions_per_example()
+            if model.use_sentence_pair:
+                eval_transitions_batch = np.concatenate([
+                    eval_transitions_batch[:,:,0], eval_transitions_batch[:,:,1]], axis=0)
+
+        if FLAGS.num_samples > 0 and len(transition_examples) < FLAGS.num_samples and i % (step % 11 + 1) == 0:
+            r = random.randint(0, len(transitions_per_example) - 1)
+            transition_examples.append((transitions_per_example[r], eval_transitions_batch[r]))
+
         if FLAGS.write_eval_report:
             reporter_args = [pred, target, eval_ids, output.data.cpu().numpy()]
             if hasattr(model, 'transition_loss'):
-                transition_preds_per_example = model.spinn.get_transition_preds_per_example()
+                transitions_per_example = model.spinn.get_transitions_per_example(
+                    style="preds" if FLAGS.eval_report_use_preds else "given")
                 if model.use_sentence_pair:
                     batch_size = pred.size(0)
-                    sent1_preds = transition_preds_per_example[:batch_size]
-                    sent2_preds = transition_preds_per_example[batch_size:]
-                    reporter_args.append(sent1_preds)
-                    reporter_args.append(sent2_preds)
+                    sent1_transitions = transitions_per_example[:batch_size]
+                    sent2_transitions = transitions_per_example[batch_size:]
+                    reporter_args.append(sent1_transitions)
+                    reporter_args.append(sent2_transitions)
                 else:
-                    reporter_args.append(transition_preds_per_example)
+                    reporter_args.append(transitions_per_example)
             reporter.save_batch(*reporter_args)
 
         # Print Progress
@@ -165,11 +163,21 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     else:
         eval_trans_acc = 0.0
 
-    logger.Log("Step: %i Eval acc: %f  %f %s Time: %5f" %
-              (step, eval_class_acc, eval_trans_acc, filename, time_metric))
+    stats_str = "Step: %i Eval acc: %f %f %s Time: %5f" % (step, eval_class_acc, eval_trans_acc, filename, time_metric)
 
-    metrics_logger.Log('eval_class_acc', eval_class_acc, step)
-    metrics_logger.Log('eval_trans_acc', eval_trans_acc, step)
+    # Extra Component.
+    stats_str += "\nEval Extra:"
+
+    if len(transition_examples) > 0:
+        for t_idx in range(len(transition_examples)):
+            gold = transition_examples[t_idx][1]
+            pred = transition_examples[t_idx][0]
+            _, crossing = evalb.crossing(gold, pred)
+            stats_str += "\n{}. crossing={}".format(t_idx, crossing)
+            stats_str += "\n     g{}".format("".join(map(str, gold)))
+            stats_str += "\n     p{}".format("".join(map(str, pred)))
+
+    logger.Log(stats_str)
 
     if FLAGS.write_eval_report:
         eval_report_path = os.path.join(FLAGS.log_path, FLAGS.experiment_name + ".report")
@@ -180,7 +188,7 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
 
 def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
     # Set checkpoint path.
-    if ckpt_path.endswith(suffix):
+    if ckpt_path.endswith(".ckpt") or ckpt_path.endswith(".ckpt_best"):
         checkpoint_path = ckpt_path
     else:
         checkpoint_path = os.path.join(ckpt_path, experiment_name + suffix)
@@ -197,23 +205,26 @@ def run(only_forward=False):
         data_manager = load_boolean_data
     elif FLAGS.data_type == "sst":
         data_manager = load_sst_data
+    elif FLAGS.data_type == "sst-binary":
+        data_manager = load_sst_binary_data
     elif FLAGS.data_type == "snli":
         data_manager = load_snli_data
     elif FLAGS.data_type == "arithmetic":
         data_manager = load_simple_data
+    elif FLAGS.data_type == "listops":
+        data_manager = load_listops_data
+    elif FLAGS.data_type == "sign":
+        data_manager = load_sign_data
+    elif FLAGS.data_type == "eq":
+        data_manager = load_eq_data
+    elif FLAGS.data_type == "relational":
+        data_manager = load_relational_data
     else:
         logger.Log("Bad data type.")
         return
 
     pp = pprint.PrettyPrinter(indent=4)
     logger.Log("Flag values:\n" + pp.pformat(FLAGS.FlagValuesDict()))
-
-    # Make Metrics Logger.
-    metrics_path = "{}/{}".format(FLAGS.metrics_path, FLAGS.experiment_name)
-    if not os.path.exists(metrics_path):
-        os.makedirs(metrics_path)
-    metrics_logger = MetricsLogger(metrics_path)
-    M = Accumulator(maxlen=FLAGS.deque_length)
 
     # Load the data.
     raw_training_data, vocabulary = data_manager.load_data(
@@ -252,8 +263,7 @@ def run(only_forward=False):
     training_data = util.PreprocessDataset(
         raw_training_data, vocabulary, FLAGS.seq_length, data_manager, eval_mode=False, logger=logger,
         sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-        for_rnn=sequential_only(),
-        use_left_padding=FLAGS.use_left_padding)
+        for_rnn=sequential_only())
     training_data_iter = util.MakeTrainingIterator(
         training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano,
         sentence_pair_data=data_manager.SENTENCE_PAIR_DATA)
@@ -267,8 +277,7 @@ def run(only_forward=False):
             FLAGS.eval_seq_length if FLAGS.eval_seq_length is not None else FLAGS.seq_length,
             data_manager, eval_mode=True, logger=logger,
             sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
-            for_rnn=sequential_only(),
-            use_left_padding=FLAGS.use_left_padding)
+            for_rnn=sequential_only())
         eval_it = util.MakeEvalIterator(eval_data,
             FLAGS.batch_size, FLAGS.eval_data_limit, bucket_eval=FLAGS.bucket_eval,
             shuffle=FLAGS.shuffle_eval, rseed=FLAGS.shuffle_eval_seed)
@@ -297,15 +306,8 @@ def run(only_forward=False):
     vocab_size = len(vocabulary)
     num_classes = len(data_manager.LABEL_MAP)
 
-    if data_manager.SENTENCE_PAIR_DATA:
-        trainer_cls = model_module.SentencePairTrainer
-        model_cls = model_module.SentencePairModel
-        use_sentence_pair = True
-    else:
-        trainer_cls = model_module.SentenceTrainer
-        model_cls = model_module.SentenceModel
-        num_classes = len(data_manager.LABEL_MAP)
-        use_sentence_pair = False
+    model_cls = model_module.BaseModel
+    use_sentence_pair = data_manager.SENTENCE_PAIR_DATA
 
     model = model_cls(model_dim=FLAGS.model_dim,
          word_embedding_dim=FLAGS.word_embedding_dim,
@@ -322,9 +324,10 @@ def run(only_forward=False):
          encode_bidirectional=FLAGS.encode_bidirectional,
          encode_num_layers=FLAGS.encode_num_layers,
          use_sentence_pair=use_sentence_pair,
-         use_skips=FLAGS.use_skips,
          lateral_tracking=FLAGS.lateral_tracking,
          use_tracking_in_composition=FLAGS.use_tracking_in_composition,
+         predict_use_cell=FLAGS.predict_use_cell,
+         use_lengths=FLAGS.use_lengths,
          use_difference_feature=FLAGS.use_difference_feature,
          use_product_feature=FLAGS.use_product_feature,
          num_mlp_layers=FLAGS.num_mlp_layers,
@@ -333,6 +336,10 @@ def run(only_forward=False):
          rl_baseline=FLAGS.rl_baseline,
          rl_reward=FLAGS.rl_reward,
          rl_weight=FLAGS.rl_weight,
+         rl_whiten=FLAGS.rl_whiten,
+         rl_epsilon=FLAGS.rl_epsilon,
+         rl_entropy=FLAGS.rl_entropy,
+         rl_entropy_beta=FLAGS.rl_entropy_beta,
          predict_leaf=FLAGS.predict_leaf,
          gen_h=FLAGS.gen_h,
         )
@@ -346,7 +353,7 @@ def run(only_forward=False):
         raise NotImplementedError
 
     # Build trainer.
-    classifier_trainer = trainer_cls(model, optimizer)
+    classifier_trainer = ModelTrainer(model, optimizer)
 
     standard_checkpoint_path = get_checkpoint_path(FLAGS.ckpt_path, FLAGS.experiment_name)
     best_checkpoint_path = get_checkpoint_path(FLAGS.ckpt_path, FLAGS.experiment_name, best=True)
@@ -376,6 +383,7 @@ def run(only_forward=False):
         model.cuda()
     else:
         model.cpu()
+    recursively_set_device(optimizer.state_dict(), the_gpu.gpu)
 
     # Debug
     def set_debug(self):
@@ -388,8 +396,21 @@ def run(only_forward=False):
     # Do an evaluation-only run.
     if only_forward:
         for index, eval_set in enumerate(eval_iterators):
-            acc = evaluate(model, eval_set, logger, metrics_logger, step, vocabulary)
+            acc = evaluate(model, eval_set, logger, step, vocabulary)
     else:
+        # Build log format strings.
+        model.train()
+        X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = get_batch(training_data_iter.next())
+        model(X_batch, transitions_batch, y_batch,
+                use_internal_parser=FLAGS.use_internal_parser,
+                validate_transitions=FLAGS.validate_transitions
+                )
+
+        train_str = train_format(model)
+        logger.Log("Train-Format: {}".format(train_str))
+        train_extra_str = train_extra_format(model)
+        logger.Log("Train-Extra-Format: {}".format(train_extra_str))
+
          # Train
         logger.Log("Training.")
 
@@ -402,16 +423,15 @@ def run(only_forward=False):
 
             start = time.time()
 
-            X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = training_data_iter.next()
+            X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = get_batch(training_data_iter.next())
 
-            if FLAGS.truncate_train_batch:
-                X_batch, transitions_batch = truncate(
-                    X_batch, transitions_batch, num_transitions_batch)
-
-            total_tokens = num_transitions_batch.ravel().sum()
+            total_tokens = sum([(nt+1)/2 for nt in num_transitions_batch.reshape(-1)])
 
             # Reset cached gradients.
             optimizer.zero_grad()
+
+            if FLAGS.model_type == "RLSPINN":
+                model.spinn.epsilon = FLAGS.rl_epsilon * math.exp(-step/FLAGS.rl_epsilon_decay)
 
             # Run model.
             output = model(X_batch, transitions_batch, y_batch,
@@ -427,81 +447,14 @@ def run(only_forward=False):
             pred = logits.data.max(1)[1].cpu() # get the index of the max log-probability
             class_acc = pred.eq(target).sum() / float(target.size(0))
 
-            A.add('class_acc', class_acc)
-            M.add('class_acc', class_acc)
-
             # Calculate class loss.
             xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
 
-            # Optionally calculate transition loss/accuracy.
-            transition_acc = model.transition_acc if hasattr(model, 'transition_acc') else 0.0
+            # Optionally calculate transition loss.
             transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
-            rl_loss = model.rl_loss if hasattr(model, 'rl_loss') else None
-            policy_loss = model.policy_loss if hasattr(model, 'policy_loss') else None
-            rae_loss = model.spinn.rae_loss if hasattr(model.spinn, 'rae_loss') else None
-            leaf_loss = model.spinn.leaf_loss if hasattr(model.spinn, 'leaf_loss') else None
-            gen_loss = model.spinn.gen_loss if hasattr(model.spinn, 'gen_loss') else None
-
-            # Force Transition Loss Optimization
-            if FLAGS.force_transition_loss:
-                model.optimize_transition_loss = True
-
-            # Accumulate stats for transition accuracy.
-            if transition_loss is not None:
-                preds = [m["t_preds"] for m in model.spinn.memories]
-                truth = [m["t_given"] for m in model.spinn.memories]
-                A.add('preds', preds)
-                A.add('truth', truth)
-
-            # Accumulate stats for leaf prediction accuracy.
-            if leaf_loss is not None:
-                A.add('leaf_acc', model.spinn.leaf_acc)
-
-            # Accumulate stats for word prediction accuracy.
-            if gen_loss is not None:
-                A.add('gen_acc', model.spinn.gen_acc)
-
-            # Note: Keep track of transition_acc, although this is a naive average.
-            # Should be weighted by length of sequences in batch.
-            M.add('transition_acc', transition_acc)
 
             # Extract L2 Cost
             l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
-
-            # Boilerplate for calculating loss values.
-            xent_cost_val = xent_loss.data[0]
-            transition_cost_val = transition_loss.data[0] if transition_loss is not None else 0.0
-            l2_cost_val = l2_loss.data[0] if l2_loss is not None else 0.0
-            rl_cost_val = rl_loss.data[0] if rl_loss is not None else 0.0
-            policy_cost_val = policy_loss.data[0] if policy_loss is not None else 0.0
-            rae_cost_val = rae_loss.data[0] if rae_loss is not None else 0.0
-            leaf_cost_val = leaf_loss.data[0] if leaf_loss is not None else 0.0
-            gen_cost_val = gen_loss.data[0] if gen_loss is not None else 0.0
-
-            # Accumulate Total Loss Data
-            total_cost_val = 0.0
-            total_cost_val += xent_cost_val
-            if transition_loss is not None and model.optimize_transition_loss:
-                total_cost_val += transition_cost_val
-            total_cost_val += l2_cost_val
-            total_cost_val += rl_cost_val
-            total_cost_val += policy_cost_val
-            total_cost_val += rae_cost_val
-            total_cost_val += leaf_cost_val
-            total_cost_val += gen_cost_val
-
-            M.add('total_cost', total_cost_val)
-            M.add('xent_cost', xent_cost_val)
-            M.add('transition_cost', transition_cost_val)
-            M.add('l2_cost', l2_cost_val)
-
-            # Logging for RL
-            rl_keys = ['rl_loss', 'policy_loss', 'norm_rewards', 'norm_baseline', 'norm_advantage']
-            for k in rl_keys:
-                if hasattr(model, k):
-                    val = getattr(model, k)
-                    val = val.data[0] if isinstance(val, Variable) else val
-                    M.add(k, val)
 
             # Accumulate Total Loss Variable
             total_loss = 0.0
@@ -510,30 +463,7 @@ def run(only_forward=False):
                 total_loss += l2_loss
             if transition_loss is not None and model.optimize_transition_loss:
                 total_loss += transition_loss
-            if rl_loss is not None:
-                total_loss += rl_loss
-            if policy_loss is not None:
-                total_loss += policy_loss
-            if rae_loss is not None:
-                total_loss += rae_loss
-            if leaf_loss is not None:
-                total_loss += leaf_loss
-            if gen_loss is not None:
-                total_loss += gen_loss
-
-            # Useful for debugging gradient flow.
-            if FLAGS.debug:
-                losses = [('total_loss', total_loss), ('xent_loss', xent_loss)]
-                if l2_loss is not None:
-                    losses.append(('l2_loss', l2_loss))
-                if transition_loss is not None and model.optimize_transition_loss:
-                    losses.append(('transition_loss', transition_loss))
-                if rl_loss is not None:
-                    losses.append(('rl_loss', rl_loss))
-                if policy_loss is not None:
-                    losses.append(('policy_loss', policy_loss))
-                debug_gradient(model, losses)
-                import ipdb; ipdb.set_trace()
+            total_loss += auxiliary_loss(model)
 
             # Backward pass.
             total_loss.backward()
@@ -555,74 +485,40 @@ def run(only_forward=False):
 
             total_time = end - start
 
+            train_accumulate(model, A)
+            A.add('class_acc', class_acc)
             A.add('total_tokens', total_tokens)
             A.add('total_time', total_time)
 
             if step % FLAGS.statistics_interval_steps == 0:
                 progress_bar.step(i=FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
                 progress_bar.finish()
-                avg_class_acc = A.get_avg('class_acc')
-                if transition_loss is not None:
-                    all_preds = np.array(flatten(A.get('preds')))
-                    all_truth = np.array(flatten(A.get('truth')))
-                    avg_trans_acc = (all_preds == all_truth).sum() / float(all_truth.shape[0])
-                else:
-                    avg_trans_acc = 0.0
-                if leaf_loss is not None:
-                    avg_leaf_acc = A.get_avg('leaf_acc')
-                else:
-                    avg_leaf_acc = 0.0
-                if gen_loss is not None:
-                    avg_gen_acc = A.get_avg('gen_acc')
-                else:
-                    avg_gen_acc = 0.0
-                time_metric = time_per_token(A.get('total_tokens'), A.get('total_time'))
-                stats_args = {
-                    "step": step,
-                    "class_acc": avg_class_acc,
-                    "transition_acc": avg_trans_acc,
-                    "total_cost": total_cost_val,
-                    "xent_cost": xent_cost_val,
-                    "transition_cost": transition_cost_val,
-                    "l2_cost": l2_cost_val,
-                    "rl_cost": rl_cost_val,
-                    "policy_cost": policy_cost_val,
-                    "rae_cost": rae_cost_val,
-                    "leaf_acc": avg_leaf_acc,
-                    "leaf_cost": leaf_cost_val,
-                    "gen_acc": avg_gen_acc,
-                    "gen_cost": gen_cost_val,
-                    "time": time_metric,
-                }
-                stats_str = "Step: {step}"
 
-                # Accuracy Component.
-                stats_str += " Acc: {class_acc:.5f} {transition_acc:.5f}"
-                if leaf_loss is not None:
-                    stats_str += " leaf{leaf_acc:.5f}"
-                if gen_loss is not None:
-                    stats_str += " gen{gen_acc:.5f}"
+                A.add('xent_cost', xent_loss.data[0])
+                A.add('l2_cost', l2_loss.data[0])
+                stats_args = train_stats(model, optimizer, A, step)
 
-                # Cost Component.
-                stats_str += " Cost: {total_cost:.5f} {xent_cost:.5f} {transition_cost:.5f} {l2_cost:.5f}"
-                if rl_loss is not None:
-                    stats_str += " r{rl_cost:.5f}"
-                if policy_loss is not None:
-                    stats_str += " p{policy_cost:.5f}"
-                if rae_loss is not None:
-                    stats_str += " rae{rae_cost:.5f}"
-                if leaf_loss is not None:
-                    stats_str += " leaf{leaf_cost:.5f}"
-                if gen_loss is not None:
-                    stats_str += " gen{gen_cost:.5f}"
+                logger.Log(train_str.format(**stats_args))
+                logger.Log(train_extra_str.format(**stats_args))
 
-                # Time Component.
-                stats_str += " Time: {time:.5f}"
-                logger.Log(stats_str.format(**stats_args))
+                if FLAGS.num_samples > 0:
+                    transition_str = ""
+                    transitions_per_example = model.spinn.get_transitions_per_example()
+                    if model.use_sentence_pair and len(transitions_batch.shape) == 3:
+                        transitions_batch = np.concatenate([
+                            transitions_batch[:,:,0], transitions_batch[:,:,1]], axis=0)
+                    for t_idx in range(FLAGS.num_samples):
+                        gold = transitions_batch[t_idx]
+                        pred = transitions_per_example[t_idx]
+                        _, crossing = evalb.crossing(gold, pred)
+                        transition_str += "\n{}. crossing={}".format(t_idx, crossing)
+                        transition_str += "\n     g{}".format("".join(map(str, gold)))
+                        transition_str += "\n     p{}".format("".join(map(str, pred)))
+                    logger.Log(transition_str)
 
             if step > 0 and step % FLAGS.eval_interval_steps == 0:
                 for index, eval_set in enumerate(eval_iterators):
-                    acc = evaluate(model, eval_set, logger, metrics_logger, step)
+                    acc = evaluate(model, eval_set, logger, step)
                     if FLAGS.ckpt_on_best_dev_error and index == 0 and (1 - acc) < 0.99 * best_dev_error and step > FLAGS.ckpt_step:
                         best_dev_error = 1 - acc
                         logger.Log("Checkpointing with new best dev accuracy of %f" % acc)
@@ -632,11 +528,6 @@ def run(only_forward=False):
             if step > FLAGS.ckpt_step and step % FLAGS.ckpt_interval_steps == 0:
                 logger.Log("Checkpointing.")
                 classifier_trainer.save(standard_checkpoint_path, step, best_dev_error)
-
-            if step % FLAGS.metrics_interval_steps == 0:
-                m_keys = M.cache.keys()
-                for k in m_keys:
-                    metrics_logger.Log(k, M.get_avg(k), step)
 
             progress_bar.step(i=step % FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
 
@@ -651,15 +542,15 @@ if __name__ == '__main__':
     gflags.DEFINE_string("experiment_name", "", "")
 
     # Data types.
-    gflags.DEFINE_enum("data_type", "bl", ["bl", "sst", "snli", "arithmetic"],
+    gflags.DEFINE_enum("data_type", "bl", ["bl", "sst", "sst-binary", "snli", "arithmetic", "listops", "sign", "eq", "relational"],
         "Which data handler and classifier to use.")
 
     # Where to store checkpoints
-    gflags.DEFINE_string("ckpt_path", ".", "Where to save/load checkpoints. Can be either "
+    gflags.DEFINE_string("log_path", "./logs", "A directory in which to write logs.")
+    gflags.DEFINE_string("ckpt_path", None, "Where to save/load checkpoints. Can be either "
         "a filename or a directory. In the latter case, the experiment name serves as the "
         "base for the filename.")
-    gflags.DEFINE_string("metrics_path", ".", "A directory in which to write logs.")
-    gflags.DEFINE_string("log_path", ".", "A directory in which to write logs.")
+    gflags.DEFINE_string("metrics_path", None, "A directory in which to write metrics.")
     gflags.DEFINE_integer("ckpt_step", 1000, "Steps to run before considering saving checkpoint.")
     gflags.DEFINE_boolean("load_best", False, "If True, attempt to load 'best' checkpoint.")
 
@@ -668,10 +559,8 @@ if __name__ == '__main__':
     gflags.DEFINE_string("eval_data_path", None, "Can contain multiple file paths, separated "
         "using ':' tokens. The first file should be the dev set, and is used for determining "
         "when to save the early stopping 'best' checkpoints.")
-    gflags.DEFINE_integer("seq_length", 30, "")
+    gflags.DEFINE_integer("seq_length", 200, "")
     gflags.DEFINE_integer("eval_seq_length", None, "")
-    gflags.DEFINE_boolean("truncate_eval_batch", True, "Shorten batches to max transition length.")
-    gflags.DEFINE_boolean("truncate_train_batch", True, "Shorten batches to max transition length.")
     gflags.DEFINE_boolean("smart_batching", True, "Organize batches using sequence length.")
     gflags.DEFINE_boolean("use_peano", True, "A mind-blowing sorting key.")
     gflags.DEFINE_integer("eval_data_limit", -1, "Truncate evaluation set. -1 indicates no truncation.")
@@ -680,10 +569,6 @@ if __name__ == '__main__':
     gflags.DEFINE_integer("shuffle_eval_seed", 123, "Seed shuffling of eval data.")
     gflags.DEFINE_string("embedding_data_path", None,
         "If set, load GloVe-formatted embeddings from here.")
-
-    # Data preprocessing settings.
-    gflags.DEFINE_boolean("use_skips", False, "Pad transitions with SKIP actions.")
-    gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
 
     # Model architecture settings.
     gflags.DEFINE_enum("model_type", "RNN", ["CBOW", "RNN", "SPINN", "RLSPINN", "RAESPINN", "GENSPINN", "ATTSPINN"], "")
@@ -696,7 +581,6 @@ if __name__ == '__main__':
         "Constrain predicted transitions to ones that give a valid parse tree.")
     gflags.DEFINE_float("embedding_keep_rate", 0.9,
         "Used for dropout on transformed embeddings and in the encoder RNN.")
-    gflags.DEFINE_boolean("force_transition_loss", False, "")
     gflags.DEFINE_boolean("use_l2_cost", True, "")
     gflags.DEFINE_boolean("use_difference_feature", True, "")
     gflags.DEFINE_boolean("use_product_feature", True, "")
@@ -708,6 +592,9 @@ if __name__ == '__main__':
         "Use previous tracker state as input for new state.")
     gflags.DEFINE_boolean("use_tracking_in_composition", True,
         "Use tracking lstm output as input for the reduce function.")
+    gflags.DEFINE_boolean("predict_use_cell", True,
+        "Use cell output as feature for transition net.")
+    gflags.DEFINE_boolean("use_lengths", False, "The transition net will be biased.")
 
     # Encode settings.
     gflags.DEFINE_boolean("use_encode", False, "Encode embeddings with sequential network.")
@@ -718,11 +605,16 @@ if __name__ == '__main__':
 
     # RL settings.
     gflags.DEFINE_float("rl_mu", 0.1, "Use in exponential moving average baseline.")
-    gflags.DEFINE_enum("rl_baseline", "ema", ["ema", "greedy", "policy"],
+    gflags.DEFINE_enum("rl_baseline", "ema", ["ema", "greedy"],
         "Different configurations to approximate reward function.")
     gflags.DEFINE_enum("rl_reward", "standard", ["standard", "xent"],
         "Different reward functions to use.")
     gflags.DEFINE_float("rl_weight", 1.0, "Hyperparam for REINFORCE loss.")
+    gflags.DEFINE_boolean("rl_whiten", False, "Reduce variance in advantage.")
+    gflags.DEFINE_boolean("rl_entropy", False, "Entropy regularization on transition policy.")
+    gflags.DEFINE_float("rl_entropy_beta", 0.001, "Entropy regularization on transition policy.")
+    gflags.DEFINE_float("rl_epsilon", 1.0, "Percent of sampled actions during train time.")
+    gflags.DEFINE_float("rl_epsilon_decay", 50000, "Percent of sampled actions during train time.")
 
     # RAE settings.
     gflags.DEFINE_boolean("predict_leaf", True, "Predict whether a node is a leaf or not.")
@@ -755,6 +647,8 @@ if __name__ == '__main__':
     gflags.DEFINE_integer("ckpt_interval_steps", 5000, "Update the checkpoint on disk at this interval.")
     gflags.DEFINE_boolean("ckpt_on_best_dev_error", True, "If error on the first eval set (the dev set) is "
         "at most 0.99 of error at the previous checkpoint, save a special 'best' checkpoint.")
+    gflags.DEFINE_boolean("evalb", False, "Print transition statistics.")
+    gflags.DEFINE_integer("num_samples", 0, "Print sampled transitions.")
 
     # Evaluation settings
     gflags.DEFINE_boolean("expanded_eval_only_mode", False,
@@ -762,6 +656,9 @@ if __name__ == '__main__':
         "transitions. The inferred parses are written to the supplied file(s) along with example-"
         "by-example accuracy information. Requirements: Must specify checkpoint path.")
     gflags.DEFINE_boolean("write_eval_report", False, "")
+    gflags.DEFINE_boolean("eval_report_use_preds", True, "If False, use the given transitions in the report, "
+        "otherwise use predicted transitions. Note that when predicting transitions but not using them, the "
+        "reported predictions will look very odd / not valid.")
 
     # Parse command line flags.
     FLAGS(sys.argv)
@@ -780,8 +677,17 @@ if __name__ == '__main__':
     if not FLAGS.sha:
         FLAGS.sha = os.popen('git rev-parse HEAD').read().strip()
 
+    if not FLAGS.ckpt_path:
+        FLAGS.ckpt_path = FLAGS.log_path
+
+    if not FLAGS.metrics_path:
+        FLAGS.metrics_path = FLAGS.log_path
+
     # HACK: The "use_encode" flag will be deprecated. Instead use something like encode_style=LSTM.
     if FLAGS.use_encode:
         FLAGS.encode_style = "LSTM"
+
+    if FLAGS.model_type == "CBOW" or FLAGS.model_type == "RNN":
+        FLAGS.num_samples = 0
 
     run(only_forward=FLAGS.expanded_eval_only_mode)

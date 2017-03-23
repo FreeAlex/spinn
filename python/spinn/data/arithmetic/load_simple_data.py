@@ -1,65 +1,78 @@
-
-#!/usr/bin/env python
-
-# Loads a file where each line contains a label, followed by a tab, followed
-# by a sequence of words with a binary parse indicated by space-separated parentheses.
-#
-# Example:
-# sentence_label	( ( word word ) ( ( word word ) word ) )
-
-import random
-from collections import deque
-
-import numpy as np
-
 from spinn import util
 
+from spinn.data import T_SHIFT, T_REDUCE, T_SKIP, T_STRUCT
+from spinn.data.arithmetic.base import NUMBERS, FIXED_VOCABULARY
+
 SENTENCE_PAIR_DATA = False
-
-NUMBERS = range(-10, 11)
-# OUTPUTS = range(-100, 101)
-OUTPUTS = range(-50, 50)
-NUM_CLASSES = len(OUTPUTS)
-
-FIXED_VOCABULARY = {str(x): i + 1 for i, x in enumerate(NUMBERS)}
-FIXED_VOCABULARY.update({
-    util.PADDING_TOKEN: 0,
-    "+": len(FIXED_VOCABULARY) + 1,
-    "-": len(FIXED_VOCABULARY) + 2
-})
-assert len(set(FIXED_VOCABULARY.values())) == len(FIXED_VOCABULARY.values())
-
+OUTPUTS = range(-10, 11)
 LABEL_MAP = {str(x): i for i, x in enumerate(OUTPUTS)}
 
-def convert_binary_bracketed_data(filename):
+
+def structure_transitions(tokens, transitions):
+
+    OP = 0
+    INT = 1
+    OPINT = 2
+    INTINT = 3
+
+    def is_op(x):
+        return x == '-' or x == '+'
+
+    def SHIFT(x):
+        return OP if is_op(x) else INT
+
+    def REDUCE(left, right):
+        if left == OP and right == INT:
+            return OPINT
+        elif left == INT and right == INT:
+            return INTINT
+        elif left == OP and right == INTINT:
+            return INT
+        elif left == OPINT and right == INT:
+            return INT
+        else:
+            raise Exception
+
+    buf = list(reversed(tokens))
+    stack = []
+    ret = []
+
+    for i, t in enumerate(transitions):
+        if t == T_SHIFT:
+            x = buf.pop()
+            stack.append(SHIFT(x))
+            ret.append(T_SHIFT)
+        elif t == T_REDUCE:
+            right, left = stack.pop(), stack.pop()
+            new_stack_item = REDUCE(left, right)
+            stack.append(new_stack_item)
+
+            if new_stack_item == INT and i < len(transitions) - 1:
+                ret.append(T_STRUCT)
+            else:
+                ret.append(T_REDUCE)
+        elif t == T_SKIP:
+            ret.append(T_SKIP)
+        else:
+            raise Exception
+    return ret
+
+
+def load_data(path, lowercase=None):
     examples = []
-    with open(filename, 'r') as f:
-        for line in f:
-            example = {}
+    with open(path) as f:
+        for example_id, line in enumerate(f):
             line = line.strip()
-            tab_split = line.split('\t')
-            example["label"] = tab_split[0]
-            example["sentence"] = tab_split[1]
-            example["tokens"] = []
-            example["transitions"] = []
+            label, seq = line.split('\t')
+            tokens, transitions = util.convert_binary_bracketed_seq(seq.split(' '))
 
-            for word in example["sentence"].split(' '):
-                if word != "(":
-                    if word != ")":
-                        example["tokens"].append(word)
-                    example["transitions"].append(1 if word == ")" else 0)
-
-            example["example_id"] = str(len(examples))
+            example = {}
+            example["label"] = label
+            example["sentence"] = seq
+            example["tokens"] = tokens
+            example["transitions"] = transitions
+            example["structure_transitions"] = structure_transitions(tokens[:], transitions[:])
+            example["example_id"] = str(example_id)
 
             examples.append(example)
-    return examples
-
-
-def load_data(path):
-    dataset = convert_binary_bracketed_data(path)
-    return dataset, FIXED_VOCABULARY
-
-if __name__ == "__main__":
-    # Demo:
-    examples, _ = load_data('simple.tsv')
-    print examples[0]
+    return examples, FIXED_VOCABULARY

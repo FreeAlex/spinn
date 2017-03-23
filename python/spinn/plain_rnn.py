@@ -12,14 +12,28 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
-from spinn.util.blocks import BaseSentencePairTrainer, Embed, to_gpu
+from spinn.util.blocks import Embed, to_gpu, MLP
 from spinn.util.misc import Args, Vocab
 
 
-class SentencePairTrainer(BaseSentencePairTrainer): pass
+def build_model(data_manager, initial_embeddings, vocab_size, num_classes, FLAGS):
+    use_sentence_pair = data_manager.SENTENCE_PAIR_DATA
+    model_cls = BaseModel
 
-
-class SentenceTrainer(SentencePairTrainer): pass
+    return model_cls(model_dim=FLAGS.model_dim,
+         word_embedding_dim=FLAGS.word_embedding_dim,
+         vocab_size=vocab_size,
+         initial_embeddings=initial_embeddings,
+         num_classes=num_classes,
+         embedding_keep_rate=FLAGS.embedding_keep_rate,
+         use_sentence_pair=use_sentence_pair,
+         use_difference_feature=FLAGS.use_difference_feature,
+         use_product_feature=FLAGS.use_product_feature,
+         classifier_keep_rate=FLAGS.semantic_classifier_keep_rate,
+         mlp_dim=FLAGS.mlp_dim,
+         num_mlp_layers=FLAGS.num_mlp_layers,
+         mlp_bn=FLAGS.mlp_bn,
+        )
 
 
 class BaseModel(nn.Module):
@@ -29,15 +43,20 @@ class BaseModel(nn.Module):
                  vocab_size=None,
                  initial_embeddings=None,
                  num_classes=None,
-                 mlp_dim=None,
                  embedding_keep_rate=None,
-                 classifier_keep_rate=None,
                  use_sentence_pair=False,
+                 classifier_keep_rate=None,
+                 mlp_dim=None,
+                 num_mlp_layers=None,
+                 mlp_bn=None,
                  **kwargs
                 ):
         super(BaseModel, self).__init__()
 
+        self.use_sentence_pair = use_sentence_pair
         self.model_dim = model_dim
+
+        classifier_dropout_rate = 1. - classifier_keep_rate
 
         args = Args()
         args.size = model_dim
@@ -55,9 +74,8 @@ class BaseModel(nn.Module):
 
         mlp_input_dim = model_dim * 2 if use_sentence_pair else model_dim
 
-        self.l0 = nn.Linear(mlp_input_dim, mlp_dim)
-        self.l1 = nn.Linear(mlp_dim, mlp_dim)
-        self.l2 = nn.Linear(mlp_dim, num_classes)
+        self.mlp = MLP(mlp_input_dim, mlp_dim, num_classes,
+            num_mlp_layers, mlp_bn, classifier_dropout_rate)
 
     def run_rnn(self, x):
         batch_size, seq_len, model_dim = x.data.size()
@@ -84,55 +102,50 @@ class BaseModel(nn.Module):
 
         return emb
 
-    def run_mlp(self, h):
-        h = self.l0(h)
-        h = F.relu(h)
-        h = self.l1(h)
-        h = F.relu(h)
-        h = self.l2(h)
-        y = h
-        return y
+    def forward(self, sentences, transitions, y_batch=None, **kwargs):
+        # Useful when investigating dynamic batching.
+        self.seq_lengths = sentences.shape[1] - (sentences == 0).sum(1)
 
+        x = self.unwrap(sentences, transitions)
+        emb = self.run_embed(x)
+        hh = torch.squeeze(self.run_rnn(emb))
+        h = self.wrap(hh)
+        output = self.mlp(h)
 
-class SentencePairModel(BaseModel):
+        return output
 
-    def build_example(self, sentences, transitions):
+    # --- Sentence Style Switches ---
+
+    def unwrap(self, sentences, transitions):
+        if self.use_sentence_pair:
+            return self.unwrap_sentence_pair(sentences, transitions)
+        return self.unwrap_sentence(sentences, transitions)
+
+    def wrap(self, hh):
+        if self.use_sentence_pair:
+            return self.wrap_sentence_pair(hh)
+        return self.wrap_sentence(hh)
+
+    # --- Sentence Specific ---
+
+    def unwrap_sentence_pair(self, sentences, transitions):
         batch_size = sentences.shape[0]
 
-        # Build Tokens
         x_prem = sentences[:,:,0]
         x_hyp = sentences[:,:,1]
         x = np.concatenate([x_prem, x_hyp], axis=0)
 
         return to_gpu(Variable(torch.from_numpy(x), volatile=not self.training))
 
-    def forward(self, sentences, transitions, y_batch=None, **kwargs):
-        batch_size = sentences.shape[0]
-
-        # Build Tokens
-        x = self.build_example(sentences, transitions)
-
-        emb = self.run_embed(x)
-
-        hh = torch.squeeze(self.run_rnn(emb))
+    def wrap_sentence_pair(self, hh):
+        batch_size = hh.size(0) / 2
         h = torch.cat([hh[:batch_size], hh[batch_size:]], 1)
-        output = self.run_mlp(h)
+        return h
 
-        return output
+    # --- Sentence Pair Specific ---
 
-
-class SentenceModel(BaseModel):
-
-    def build_example(self, sentences, transitions):
+    def unwrap_sentence(self, sentences, transitions):
         return to_gpu(Variable(torch.from_numpy(sentences), volatile=not self.training))
 
-    def forward(self, sentences, transitions, y_batch=None, **kwargs):
-        # Build Tokens
-        x = self.build_example(sentences, transitions)
-
-        emb = self.run_embed(x)
-
-        h = torch.squeeze(self.run_rnn(emb))
-        output = self.run_mlp(h)
-
-        return output
+    def wrap_sentence(self, hh):
+        return hh

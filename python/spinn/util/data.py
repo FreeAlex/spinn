@@ -8,6 +8,8 @@ import sys
 import numpy as np
 
 
+from spinn.data import T_SHIFT, T_REDUCE, T_SKIP, T_STRUCT
+
 # With loaded embedding matrix, the padding vector will be initialized to zero
 # and will not be trained. Hopefully this isn't a problem. It seems better than
 # random initialization...
@@ -17,9 +19,9 @@ PADDING_TOKEN = "*PADDING*"
 # it's a common token that is pretrained, but shouldn't look like any content words.
 UNK_TOKEN = "_"
 
-SKIP_SYMBOL = 2
-SHIFT_SYMBOL = 0
-REDUCE_SYMBOL = 1
+T_SHIFT = 0
+T_REDUCE = 1
+T_SKIP = 2
 SENTENCE_PADDING_SYMBOL = 0
 
 CORE_VOCABULARY = {PADDING_TOKEN: 0,
@@ -127,6 +129,8 @@ def CropAndPadExample(example, left_padding, target_length, key, symbol=0, logge
     Crop/pad a sequence value of the given dict `example`.
     """
     if left_padding < 0:
+        raise NotImplementedError("Behavior for cropped examples is not well-defined."
+            "Please set sequence length to some sufficiently large value and turn on truncating.")
         # Crop, then pad normally.
         # TODO: Track how many sentences are cropped, but don't log a message
         # for every single one.
@@ -137,29 +141,32 @@ def CropAndPadExample(example, left_padding, target_length, key, symbol=0, logge
         example[key] + ([symbol] * right_padding)
 
 
-def CropAndPad(dataset, length, logger=None, sentence_pair_data=False, use_left_padding=True):
+def CropAndPad(dataset, length, logger=None, sentence_pair_data=False):
     # NOTE: This can probably be done faster in NumPy if it winds up making a
     # difference.
     # Always make sure that the transitions are aligned at the left edge, so
     # the final stack top is the root of the tree. If cropping is used, it should
     # just introduce empty nodes into the tree.
     if sentence_pair_data:
-        keys = [("premise_transitions", "num_premise_transitions", "premise_tokens"),
-                ("hypothesis_transitions", "num_hypothesis_transitions", "hypothesis_tokens")]
+        keys = [("premise_transitions", "premise_structure_transitions", "num_premise_transitions", "premise_tokens"),
+                ("hypothesis_transitions", "hypothesis_structure_transitions", "num_hypothesis_transitions", "hypothesis_tokens")]
     else:
-        keys = [("transitions", "num_transitions", "tokens")]
+        keys = [("transitions", "structure_transitions", "num_transitions", "tokens")]
 
     for example in dataset:
-        for (transitions_key, num_transitions_key, tokens_key) in keys:
+        for (transitions_key, structure_transitions_key, num_transitions_key, tokens_key) in keys:
+            # Crop and Pad Transitions
             example[num_transitions_key] = len(example[transitions_key])
             transitions_left_padding = length - example[num_transitions_key]
-            if not use_left_padding and transitions_left_padding > 0:
-                transitions_left_padding = 0
             shifts_before_crop_and_pad = example[transitions_key].count(0)
-            CropAndPadExample(
-                example, transitions_left_padding, length, transitions_key,
-                symbol=SKIP_SYMBOL, logger=logger)
+            for tkey in [transitions_key, structure_transitions_key]:
+                if tkey in example:
+                    CropAndPadExample(
+                        example, transitions_left_padding, length, tkey,
+                        symbol=T_SKIP, logger=logger)
             shifts_after_crop_and_pad = example[transitions_key].count(0)
+
+            # Crop and Pad Tokens
             tokens_left_padding = shifts_after_crop_and_pad - \
                 shifts_before_crop_and_pad
             CropAndPadExample(
@@ -358,22 +365,22 @@ def MakeBucketEvalIterator(sources, batch_size):
 
 
 def PreprocessDataset(dataset, vocabulary, seq_length, data_manager, eval_mode=False, logger=None,
-                      sentence_pair_data=False, for_rnn=False, use_left_padding=True):
+                      sentence_pair_data=False, for_rnn=False):
     # TODO(SB): Simpler version for plain RNN.
     dataset = TrimDataset(dataset, seq_length, eval_mode=eval_mode, sentence_pair_data=sentence_pair_data)
     dataset = TokensToIDs(vocabulary, dataset, sentence_pair_data=sentence_pair_data)
     if for_rnn:
         dataset = CropAndPadForRNN(dataset, seq_length, logger=logger, sentence_pair_data=sentence_pair_data)
     else:
-        dataset = CropAndPad(dataset, seq_length, logger=logger, sentence_pair_data=sentence_pair_data, use_left_padding=use_left_padding)
+        dataset = CropAndPad(dataset, seq_length, logger=logger, sentence_pair_data=sentence_pair_data)
 
     if sentence_pair_data:
         X = np.transpose(np.array([[example["premise_tokens"] for example in dataset],
                       [example["hypothesis_tokens"] for example in dataset]],
                      dtype=np.int32), (1, 2, 0))
         if for_rnn:
-            # TODO(SB): Extend this clause to the non-pair case.
             transitions = np.zeros((len(dataset), 2, 0))
+            structure_transitions = np.zeros((len(dataset), 2, 0))
             num_transitions = np.transpose(np.array(
                 [[len(np.array(example["premise_tokens"]).nonzero()[0]) for example in dataset],
                  [len(np.array(example["hypothesis_tokens"]).nonzero()[0]) for example in dataset]],
@@ -382,6 +389,9 @@ def PreprocessDataset(dataset, vocabulary, seq_length, data_manager, eval_mode=F
             transitions = np.transpose(np.array([[example["premise_transitions"] for example in dataset],
                                     [example["hypothesis_transitions"] for example in dataset]],
                                    dtype=np.int32), (1, 2, 0))
+            structure_transitions = np.transpose(np.array([[example.get("premise_transitions", []) for example in dataset],
+                                    [example.get("hypothesis_transitions", [-1]) for example in dataset]],
+                                   dtype=np.int32), (1, 2, 0))
             num_transitions = np.transpose(np.array(
                 [[example["num_premise_transitions"] for example in dataset],
                  [example["num_hypothesis_transitions"] for example in dataset]],
@@ -389,11 +399,20 @@ def PreprocessDataset(dataset, vocabulary, seq_length, data_manager, eval_mode=F
     else:
         X = np.array([example["tokens"] for example in dataset],
                      dtype=np.int32)
-        transitions = np.array([example["transitions"] for example in dataset],
-                               dtype=np.int32)
-        num_transitions = np.array(
-            [example["num_transitions"] for example in dataset],
-            dtype=np.int32)
+        if for_rnn:
+            transitions = np.zeros((len(dataset), 0))
+            structure_transitions = np.zeros((len(dataset), 0))
+            num_transitions = np.array(
+                [len(np.array(example["tokens"]).nonzero()[0]) for example in dataset],
+                dtype=np.int32)
+        else:
+            transitions = np.array([example["transitions"] for example in dataset],
+                                   dtype=np.int32)
+            structure_transitions = np.array([example.get("structure_transitions", [-1]) for example in dataset],
+                                   dtype=np.int32)
+            num_transitions = np.array(
+                [example["num_transitions"] for example in dataset],
+                dtype=np.int32)
     y = np.array(
         [data_manager.LABEL_MAP[example["label"]] for example in dataset],
         dtype=np.int32)
@@ -401,7 +420,7 @@ def PreprocessDataset(dataset, vocabulary, seq_length, data_manager, eval_mode=F
     # NP Array of Strings
     example_ids = np.array([example["example_id"] for example in dataset])
 
-    return X, transitions, y, num_transitions, example_ids
+    return X, transitions, y, num_transitions, structure_transitions, example_ids
 
 
 def BuildVocabulary(raw_training_data, raw_eval_sets, embedding_path, logger=None, sentence_pair_data=False):
@@ -463,9 +482,12 @@ def LoadEmbeddingsFromText(vocabulary, embedding_dim, path):
     with open(path, 'r') as f:
         for line in f:
             spl = line.split(" ")
+            if len(spl) < embedding_dim + 1:
+                # Header row or final row
+                continue
             word = spl[0]
             if word in vocabulary:
-                emb[vocabulary[word], :] = [float(e) for e in spl[1:]]
+                emb[vocabulary[word], :] = [float(e) for e in spl[1:embedding_dim + 1]]
     return emb
 
 
@@ -518,3 +540,13 @@ class SimpleProgressBar(object):
         if not self.enabled: return
         self.reset()
         sys.stdout.write('\n')
+
+
+def convert_binary_bracketed_seq(seq):
+    tokens, transitions = [], []
+    for item in seq:
+        if item != "(":
+            if item != ")":
+                tokens.append(item)
+            transitions.append(T_REDUCE if item == ")" else T_SHIFT)
+    return tokens, transitions

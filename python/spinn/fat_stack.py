@@ -10,7 +10,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
-from spinn.util.blocks import BaseSentencePairTrainer, Reduce
+from spinn.util.blocks import Reduce
 from spinn.util.blocks import LSTMState, Embed, MLP, Linear, LSTM
 from spinn.util.blocks import reverse_tensor
 from spinn.util.blocks import bundle, unbundle, to_cpu, to_gpu, treelstm, lstm
@@ -18,26 +18,46 @@ from spinn.util.blocks import get_h, get_c
 from spinn.util.misc import Args, Vocab, Example
 from spinn.util.blocks import HeKaimingInitializer
 
-
-T_SKIP   = 2
-T_SHIFT  = 0
-T_REDUCE = 1
+from spinn.data import T_SHIFT, T_REDUCE, T_SKIP, T_STRUCT
 
 
-"""
+def build_model(data_manager, initial_embeddings, vocab_size, num_classes, FLAGS):
+    model_cls = BaseModel
+    use_sentence_pair = data_manager.SENTENCE_PAIR_DATA
 
-Missing Features
-
-- [ ] Optionally use cell when predicting transitions.
-
-
-"""
-
-
-class SentencePairTrainer(BaseSentencePairTrainer): pass
-
-
-class SentenceTrainer(SentencePairTrainer): pass
+    return model_cls(model_dim=FLAGS.model_dim,
+         word_embedding_dim=FLAGS.word_embedding_dim,
+         vocab_size=vocab_size,
+         initial_embeddings=initial_embeddings,
+         num_classes=num_classes,
+         embedding_keep_rate=FLAGS.embedding_keep_rate,
+         tracking_lstm_hidden_dim=FLAGS.tracking_lstm_hidden_dim,
+         transition_weight=FLAGS.transition_weight,
+         encode_style=FLAGS.encode_style,
+         encode_reverse=FLAGS.encode_reverse,
+         encode_bidirectional=FLAGS.encode_bidirectional,
+         encode_num_layers=FLAGS.encode_num_layers,
+         use_sentence_pair=use_sentence_pair,
+         lateral_tracking=FLAGS.lateral_tracking,
+         use_tracking_in_composition=FLAGS.use_tracking_in_composition,
+         predict_use_cell=FLAGS.predict_use_cell,
+         use_lengths=FLAGS.use_lengths,
+         use_difference_feature=FLAGS.use_difference_feature,
+         use_product_feature=FLAGS.use_product_feature,
+         classifier_keep_rate=FLAGS.semantic_classifier_keep_rate,
+         mlp_dim=FLAGS.mlp_dim,
+         num_mlp_layers=FLAGS.num_mlp_layers,
+         mlp_bn=FLAGS.mlp_bn,
+         rl_mu=FLAGS.rl_mu,
+         rl_baseline=FLAGS.rl_baseline,
+         rl_reward=FLAGS.rl_reward,
+         rl_weight=FLAGS.rl_weight,
+         rl_whiten=FLAGS.rl_whiten,
+         rl_entropy=FLAGS.rl_entropy,
+         rl_entropy_beta=FLAGS.rl_entropy_beta,
+         predict_leaf=FLAGS.predict_leaf,
+         gen_h=FLAGS.gen_h,
+        )
 
 
 class Tracker(nn.Module):
@@ -100,14 +120,14 @@ class Tracker(nn.Module):
 
 class SPINN(nn.Module):
 
-    def __init__(self, args, vocab, use_skips=False):
+    def __init__(self, args, vocab, predict_use_cell, use_lengths):
         super(SPINN, self).__init__()
 
         # Optional debug mode.
         self.debug = False
 
         self.transition_weight = args.transition_weight
-        self.use_skips = use_skips
+        self.use_lengths = use_lengths
 
         # Reduce function for semantic composition.
         self.reduce = Reduce(args.size, args.tracker_size, args.use_tracking_in_composition)
@@ -115,11 +135,13 @@ class SPINN(nn.Module):
             self.tracker = Tracker(args.size, args.tracker_size, args.lateral_tracking)
             if args.transition_weight is not None:
                 # TODO: Might be interesting to try a different network here.
-                self.transition_net = nn.Linear(args.tracker_size, 3 if use_skips else 2)
+                self.predict_use_cell = predict_use_cell
+                tinp_size = args.tracker_size * 2 if predict_use_cell else args.tracker_size
+                if self.use_lengths:
+                    tinp_size += 2
+                self.transition_net = nn.Linear(tinp_size, 2)
 
-        # Predict 2 or 3 actions depending on whether SKIPs will be predicted.
-        choices = [T_SHIFT, T_REDUCE, T_SKIP] if use_skips else [T_SHIFT, T_REDUCE]
-        self.choices = np.array(choices, dtype=np.int32)
+        self.choices = np.array([T_SHIFT, T_REDUCE], dtype=np.int32)
 
     def reset_state(self):
         self.memories = []
@@ -139,7 +161,7 @@ class SPINN(nn.Module):
         #   used as input to the tracker.
         # - For the first two steps, the stack would be empty, but we add
         #   zeros so that the tracker still gets input.
-        zeros = to_gpu(Variable(torch.from_numpy(
+        zeros = self.zeros = to_gpu(Variable(torch.from_numpy(
             np.zeros(self.bufs[0][0].size(), dtype=np.float32)),
             volatile=self.bufs[0][0].volatile))
 
@@ -169,6 +191,12 @@ class SPINN(nn.Module):
         stack_adjust = 2 if zero_padded else 0
 
         _transitions = np.array(transitions)
+        _preds = preds.copy()
+        _invalid = np.zeros(preds.shape, dtype=np.bool)
+
+        incorrect = 0
+        cant_skip = _transitions != T_SKIP
+        must_skip = _transitions == T_SKIP
 
         # Fixup predicted skips.
         if len(self.choices) > 2:
@@ -179,51 +207,43 @@ class SPINN(nn.Module):
 
         # Cannot reduce on too small a stack
         must_shift = np.array([length < 2 for length in stack_lens])
-        preds[must_shift] = T_SHIFT
+        check_mask = np.logical_and(cant_skip, must_shift)
+        _invalid += np.logical_and(_preds != T_SHIFT, check_mask)
+        _preds[must_shift] = T_SHIFT
 
         # Cannot shift on too small buf
         must_reduce = np.array([length < 1 for length in buf_lens])
-        preds[must_reduce] = T_REDUCE
+        check_mask = np.logical_and(cant_skip, must_reduce)
+        _invalid += np.logical_and(_preds != T_REDUCE, check_mask)
+        _preds[must_reduce] = T_REDUCE
 
         # If the given action is skip, then must skip.
-        preds[_transitions == T_SKIP] = T_SKIP
+        _preds[must_skip] = T_SKIP
 
-        return preds
+        return _preds, _invalid
 
-    def predict_actions(self, transition_output, cant_skip):
+    def predict_actions(self, transition_output):
         transition_dist = F.log_softmax(transition_output)
         transition_dist = transition_dist.data.cpu().numpy()
         transition_preds = transition_dist.argmax(axis=1)
         return transition_preds
 
-    def get_statistics(self):
-        # TODO: These are not necessarily the most efficient flatten operations...
+    def get_transitions_per_example(self, style="preds"):
+        if style == "preds":
+            source = "t_preds"
+        elif style == "given":
+            source = "t_given"
+        else:
+            raise NotImplementedError
 
-        t_preds = np.array(reduce(lambda x, y: x + y.tolist(),
-            [m["t_preds"] for m in self.memories], []))
-        t_given = np.array(reduce(lambda x, y: x + y.tolist(),
-            [m["t_given"] for m in self.memories], []))
-        t_mask = np.array(reduce(lambda x, y: x + y.tolist(),
-            [m["t_mask"] for m in self.memories], []))
-        t_logits = [m["t_logits"] for m in self.memories]
-        if len(t_logits) > 0:
-            t_logits = torch.cat(t_logits, 0)
+        _transitions = [m[source].reshape(1, -1) for m in self.memories if m.get(source, None) is not None]
+        transitions = np.concatenate(_transitions).T
 
-        return t_preds, t_logits, t_given, t_mask
-
-    def get_transition_preds_per_example(self):
-        t_preds, t_logits, t_given, t_mask = self.get_statistics()
-
-        batch_size = t_mask.max()
-        preds = []
-        for batch_idx in range(batch_size):
-            preds.append(t_preds[t_mask == batch_idx])
-
-        return np.array(preds)
+        return transitions
 
     def t_shift(self, buf, stack, tracking, buf_tops, trackings):
         """SHIFT: Should dequeue buffer and item to stack."""
-        buf_tops.append(buf.pop())
+        buf_tops.append(buf.pop() if len(buf) > 0 else self.zeros)
         trackings.append(tracking)
 
     def t_reduce(self, buf, stack, tracking, lefts, rights, trackings):
@@ -240,10 +260,7 @@ class SPINN(nn.Module):
                 # then treat any available item as the right input, and use zeros
                 # for any other inputs.
                 # NOTE: Only happens on cropped data.
-                zeros = to_gpu(Variable(
-                    torch.from_numpy(np.zeros(buf[0].size(), dtype=np.float32)),
-                    volatile=buf[0].volatile))
-                reduce_inp.append(zeros)
+                reduce_inp.append(self.zeros)
 
         trackings.append(tracking)
 
@@ -279,6 +296,8 @@ class SPINN(nn.Module):
         transition_loss = None
         transition_acc = 0.0
         num_transitions = inp_transitions.shape[1]
+        batch_size = inp_transitions.shape[0]
+        invalid_count = np.zeros(batch_size)
 
         # Transition Loop
         # ===============
@@ -288,104 +307,83 @@ class SPINN(nn.Module):
             transition_arr = list(transitions)
             sub_batch_size = len(transition_arr)
 
-            # A mask to select all non-SKIP transitions.
-            cant_skip = np.array([t != T_SKIP for t in transitions])
+            # A mask based on SKIP transitions.
+            cant_skip = np.array(transitions) != T_SKIP
+            must_skip = np.array(transitions) == T_SKIP
 
-            # Remember important details from this time step.
+            # Memories
+            # ========
+            # Keep track of key values to determine accuracy and loss.
             self.memory = {}
 
             # Run if:
             # A. We have a tracking component and,
             # B. There is at least one transition that will not be skipped.
-            if hasattr(self, 'tracker') and (self.use_skips or sum(cant_skip) > 0):
+            if hasattr(self, 'tracker') and sum(cant_skip) > 0:
 
                 # Prepare tracker input.
-                try:
-                    top_buf = bundle(buf[-1] for buf in self.bufs)
-                    top_stack_1 = bundle(stack[-1] for stack in self.stacks)
-                    top_stack_2 = bundle(stack[-2] for stack in self.stacks)
-                except:
+                if self.debug and any(len(buf) < 1 or len(stack) for buf, stack in zip(self.bufs, self.stacks)):
                     # To elaborate on this exception, when cropping examples it is possible
                     # that your first 1 or 2 actions is a reduce action. It is unclear if this
                     # is a bug in cropping or a bug in how we think about cropping. In the meantime,
                     # turn on the truncate batch flag, and set the eval_seq_length very high.
-                    raise NotImplementedError("Warning: You are probably trying to encode examples"
+                    raise IndexError("Warning: You are probably trying to encode examples"
                           "with cropped transitions. Although, this is a reasonable"
                           "feature, when predicting/validating transitions, you"
                           "probably will not get the behavior that you expect. Disable"
                           "this exception if you dare.")
-                    # Uncomment to handle weirdly placed actions like discussed in the above exception.
-                    # =========
-                    # zeros = to_gpu(Variable(torch.from_numpy(
-                    #     np.zeros(self.bufs[0][0].size(), dtype=np.float32)),
-                    #     volatile=self.bufs[0][0].volatile))
-                    # top_buf = bundle(buf[-1] for buf in self.bufs)
-                    # top_stack_1 = bundle(stack[-1] if len(stack) > 0 else zeros for stack in self.stacks)
-                    # top_stack_2 = bundle(stack[-2] if len(stack) > 1 else zeros for stack in self.stacks)
+                top_buf = bundle(buf[-1] if len(buf) > 0 else self.zeros for buf in self.bufs)
+                top_stack_1 = bundle(stack[-1] if len(stack) > 0 else self.zeros for stack in self.stacks)
+                top_stack_2 = bundle(stack[-2] if len(stack) > 1 else self.zeros for stack in self.stacks)
 
                 # Get hidden output from the tracker. Used to predict transitions.
                 tracker_h, tracker_c = self.tracker(top_buf, top_stack_1, top_stack_2)
 
                 if hasattr(self, 'transition_net'):
-                    transition_output = self.transition_net(tracker_h)
+                    transition_inp = [tracker_h]
+                    if self.use_lengths:
+                        buf_lens = to_gpu(Variable(torch.FloatTensor([len(buf) for buf in self.bufs]), volatile=not self.training).view(-1, 1))
+                        stack_lens = to_gpu(Variable(torch.FloatTensor([len(stack) for stack in self.stacks]), volatile=not self.training).view(-1, 1))
+                        transition_inp += [buf_lens, stack_lens]
+                    if self.predict_use_cell:
+                        transition_inp += [tracker_c]
+                    transition_inp = torch.cat(transition_inp, 1)
+                    transition_output = self.transition_net(transition_inp)
 
                 if hasattr(self, 'transition_net') and run_internal_parser:
 
                     # Predict Actions
                     # ===============
 
-                    t_logits = F.log_softmax(transition_output)
-                    t_given = transitions
+                    # Distribution of transitions use to calculate transition loss.
+                    self.memory["t_logits"] = F.log_softmax(transition_output)
+
+                    # Given transitions.
+                    self.memory["t_given"] = transitions
+
                     # TODO: Mask before predicting. This should simplify things and reduce computation.
                     # The downside is that in the Action Phase, need to be smarter about which stacks/bufs
                     # are selected.
-                    transition_preds = self.predict_actions(transition_output, cant_skip)
+                    transition_preds = self.predict_actions(transition_output)
 
                     # Constrain to valid actions
                     # ==========================
 
+                    validated_preds, invalid_mask = self.validate(transition_arr, transition_preds, self.stacks, self.bufs)
                     if validate_transitions:
-                        transition_preds = self.validate(transition_arr, transition_preds, self.stacks, self.bufs)
+                        transition_preds = validated_preds
 
-                    t_preds = transition_preds
+                    # Keep track of which predictions have been valid.
+                    invalid_count += invalid_mask
 
-                    # Indices of examples that have a transition.
-                    t_mask = np.arange(sub_batch_size)
-
-                    # Filter to non-SKIP values
-                    # =========================
-
-                    if not self.use_skips:
-                        t_preds = t_preds[cant_skip]
-                        t_given = t_given[cant_skip]
-                        t_mask = t_mask[cant_skip]
-
-                        # Be careful when filtering distributions. These values are used to
-                        # calculate loss and need to be used in backprop.
-                        index = (cant_skip * np.arange(cant_skip.shape[0]))[cant_skip]
-                        index = to_gpu(Variable(torch.from_numpy(index).long(), volatile=t_logits.volatile))
-                        t_logits = torch.index_select(t_logits, 0, index)
-
-
-                    # Memories
-                    # ========
-                    # Keep track of key values to determine accuracy and loss.
-                    # (optional) Filter to only non-skipped transitions. When filtering values
-                    # that will be backpropagated over, be careful that gradient flow isn't broken.
+                    # If the given action is skip, then must skip.
+                    transition_preds[must_skip] = T_SKIP
 
                     # Actual transition predictions. Used to measure transition accuracy.
-                    self.memory["t_preds"] = t_preds
+                    self.memory["t_preds"] = transition_preds
 
-                    # Distribution of transitions use to calculate transition loss.
-                    self.memory["t_logits"] = t_logits
-
-                    # Given transitions.
-                    self.memory["t_given"] = t_given
-
-                    # Record step index.
-                    self.memory["t_mask"] = t_mask
-
-                    # TODO: Write tests to make sure memories look right in the various settings.
+                    # Binary mask of examples that have a transition.
+                    self.memory["t_mask"] = cant_skip
 
                     # If this FLAG is set, then use the predicted actions rather than the given.
                     if use_internal_parser:
@@ -427,20 +425,37 @@ class SPINN(nn.Module):
             # Memory Phase
             # ============
 
+            # APPEND ALL MEMORIES. MASK LATER.
+
             self.memories.append(self.memory)
 
         # Loss Phase
         # ==========
 
         if hasattr(self, 'tracker') and hasattr(self, 'transition_net'):
-            t_preds, t_logits, t_given, _ = self.get_statistics()
+            t_preds = np.concatenate([m['t_preds'] for m in self.memories if m.get('t_preds', None) is not None])
+            t_given = np.concatenate([m['t_given'] for m in self.memories if m.get('t_given', None) is not None])
+            t_mask = np.concatenate([m['t_mask'] for m in self.memories if m.get('t_mask', None) is not None])
+            t_logits = torch.cat([m['t_logits'] for m in self.memories if m.get('t_logits', None) is not None], 0)
 
             # We compute accuracy and loss after all transitions have complete,
             # since examples can have different lengths when not using skips.
-            transition_acc = (t_preds == t_given).sum() / float(t_preds.shape[0])
-            transition_loss = nn.NLLLoss()(t_logits, to_gpu(Variable(
-                torch.from_numpy(t_given), volatile=t_logits.volatile)))
-            transition_loss *= self.transition_weight
+
+            # Transition Accuracy.
+            n = t_mask.shape[0]
+            n_skips = n - t_mask.sum()
+            n_total = n - n_skips
+            n_correct = (t_preds == t_given).sum() - n_skips
+            transition_acc = n_correct / float(n_total)
+
+            # Transition Loss.
+            index = to_gpu(Variable(torch.from_numpy(np.arange(t_mask.shape[0])[t_mask])).long())
+            select_t_given = to_gpu(Variable(torch.from_numpy(t_given[t_mask]), volatile=not self.training).long())
+            select_t_logits = torch.index_select(t_logits, 0, index)
+            transition_loss = nn.NLLLoss()(select_t_logits, select_t_given) * self.transition_weight
+
+            self.n_invalid = (invalid_count > 0).sum()
+            self.invalid = self.n_invalid / float(batch_size)
 
         self.loss_phase_hook()
 
@@ -463,23 +478,24 @@ class BaseModel(nn.Module):
                  vocab_size=None,
                  initial_embeddings=None,
                  num_classes=None,
-                 mlp_dim=None,
                  embedding_keep_rate=None,
-                 classifier_keep_rate=None,
                  tracking_lstm_hidden_dim=4,
                  transition_weight=None,
                  encode_style=None,
                  encode_reverse=None,
                  encode_bidirectional=None,
                  encode_num_layers=None,
-                 use_skips=False,
                  lateral_tracking=None,
                  use_tracking_in_composition=None,
+                 predict_use_cell=None,
+                 use_lengths=None,
                  use_sentence_pair=False,
                  use_difference_feature=False,
                  use_product_feature=False,
+                 mlp_dim=None,
                  num_mlp_layers=None,
                  mlp_bn=None,
+                 classifier_keep_rate=None,
                  use_projection=None,
                  **kwargs
                 ):
@@ -507,22 +523,21 @@ class BaseModel(nn.Module):
         vocab.vectors = initial_embeddings
 
         # Build parsing component.
-        self.spinn = self.build_spinn(args, vocab, use_skips)
+        self.spinn = self.build_spinn(args, vocab, predict_use_cell, use_lengths)
 
         # Build classiifer.
         features_dim = self.get_features_dim()
         self.mlp = MLP(features_dim, mlp_dim, num_classes,
             num_mlp_layers, mlp_bn, classifier_dropout_rate)
 
-        # The input embeddings represent the hidden and cell state, so multiply by 2.
         self.embedding_dropout_rate = 1. - embedding_keep_rate
-        input_embedding_dim = args.size * 2
 
         # Projection will effectively be done by the encoding network.
         use_projection = True if encode_style is None else False
+        input_dim = model_dim if use_projection else word_embedding_dim
 
         # Create dynamic embedding layer.
-        self.embed = Embed(input_embedding_dim, vocab.size, vectors=vocab.vectors, use_projection=use_projection)
+        self.embed = Embed(input_dim, vocab.size, vectors=vocab.vectors, use_projection=use_projection)
 
         # Optionally build input encoder.
         if encode_style is not None:
@@ -563,29 +578,23 @@ class BaseModel(nn.Module):
             raise NotImplementedError
         return encoding_net
 
-    def build_spinn(self, args, vocab, use_skips):
-        return SPINN(args, vocab, use_skips=use_skips)
-
-    def build_example(self, sentences, transitions):
-        raise Exception('Not implemented.')
-
-    def spinn_hook(self, state):
-        pass
+    def build_spinn(self, args, vocab, predict_use_cell, use_lengths):
+        return SPINN(args, vocab, predict_use_cell, use_lengths)
 
     def run_spinn(self, example, use_internal_parser, validate_transitions=True):
         self.spinn.reset_state()
-        state, transition_acc, transition_loss = self.spinn(example,
+        h_list, transition_acc, transition_loss = self.spinn(example,
                                use_internal_parser=use_internal_parser,
                                validate_transitions=validate_transitions)
-        self.spinn_hook(state)
-        return state, transition_acc, transition_loss
+        h = self.wrap(h_list)
+        return h, transition_acc, transition_loss
 
-    def output_hook(self, output, sentences, transitions, y_batch=None):
+    def output_hook(self, output, sentences, transitions, y_batch=None, embeds=None):
         pass
 
     def forward(self, sentences, transitions, y_batch=None,
                  use_internal_parser=False, validate_transitions=True):
-        example = self.build_example(sentences, transitions)
+        example = self.unwrap(sentences, transitions)
 
         b, l = example.tokens.size()[:2]
 
@@ -616,14 +625,47 @@ class BaseModel(nn.Module):
 
         output = self.mlp(features)
 
-        self.output_hook(output, sentences, transitions, y_batch)
+        self.output_hook(output, sentences, transitions, y_batch, embeds)
 
         return output
 
+    # --- Sentence Style Switches ---
 
-class SentencePairModel(BaseModel):
+    def unwrap(self, sentences, transitions):
+        if self.use_sentence_pair:
+            return self.unwrap_sentence_pair(sentences, transitions)
+        return self.unwrap_sentence(sentences, transitions)
 
-    def build_example(self, sentences, transitions):
+    def wrap(self, h_list):
+        if self.use_sentence_pair:
+            return self.wrap_sentence_pair(h_list)
+        return self.wrap_sentence(h_list)
+
+    # --- Sentence Model Specific ---
+
+    def unwrap_sentence(self, sentences, transitions):
+        batch_size = sentences.shape[0]
+
+        # Build Tokens
+        x = sentences
+
+        # Build Transitions
+        t = transitions
+
+        example = Example()
+        example.tokens = to_gpu(Variable(torch.from_numpy(x), volatile=not self.training))
+        example.transitions = t
+
+        return example
+
+    def wrap_sentence(self, h_list):
+        batch_size = len(h_list) / 2
+        h = get_h(torch.cat(h_list, 0), self.hidden_dim)
+        return [h]
+
+    # --- Sentence Pair Model Specific ---
+
+    def unwrap_sentence_pair(self, sentences, transitions):
         batch_size = sentences.shape[0]
 
         # Build Tokens
@@ -642,34 +684,8 @@ class SentencePairModel(BaseModel):
 
         return example
 
-    def run_spinn(self, example, use_internal_parser=False, validate_transitions=True):
-        state_both, transition_acc, transition_loss = super(SentencePairModel, self).run_spinn(
-            example, use_internal_parser, validate_transitions)
-        batch_size = len(state_both) / 2
-        h_premise = get_h(torch.cat(state_both[:batch_size], 0), self.hidden_dim)
-        h_hypothesis = get_h(torch.cat(state_both[batch_size:], 0), self.hidden_dim)
-        return [h_premise, h_hypothesis], transition_acc, transition_loss
-
-
-class SentenceModel(BaseModel):
-
-    def build_example(self, sentences, transitions):
-        batch_size = sentences.shape[0]
-
-        # Build Tokens
-        x = sentences
-
-        # Build Transitions
-        t = transitions
-
-        example = Example()
-        example.tokens = to_gpu(Variable(torch.from_numpy(x), volatile=not self.training))
-        example.transitions = t
-
-        return example
-
-    def run_spinn(self, example, use_internal_parser=False, validate_transitions=True):
-        state, transition_acc, transition_loss = super(SentenceModel, self).run_spinn(
-            example, use_internal_parser, validate_transitions)
-        h = get_h(torch.cat(state, 0), self.hidden_dim)
-        return [h], transition_acc, transition_loss
+    def wrap_sentence_pair(self, h_list):
+        batch_size = len(h_list) / 2
+        h_premise = get_h(torch.cat(h_list[:batch_size], 0), self.hidden_dim)
+        h_hypothesis = get_h(torch.cat(h_list[batch_size:], 0), self.hidden_dim)
+        return [h_premise, h_hypothesis]
