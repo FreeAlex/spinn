@@ -174,6 +174,7 @@ class AttentionModel(nn.Module):
             fe_mi = torch.stack([fe_m[i]] * ps.size(0), 0)
             fe_pi = F.linear(ps, self.weight_premise)
             ek = F.tanh(fe_pi + fe_hi + fe_mi).mv(self.w_e)
+            ek = F.softmax(ek)
             ak = ps.t().mv(ek)
             assert ak.size() == (self.hidden_dim,)
             assert len(aks) == i
@@ -393,7 +394,7 @@ class SentencePairModel(nn.Module):
 
         # attention model
         h_m = self.attention(ps, hs)    # matching matrix batch_size * hidden_dim
-        assert h_m.size(1) == self.hidden_dim
+        assert h_m.size() == (len(ps), self.hidden_dim)
         # print 'run attention complete'
 
         features = self.build_features(hs, h_m)
