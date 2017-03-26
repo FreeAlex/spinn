@@ -192,6 +192,7 @@ def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
 def run(only_forward=False):
     logger = afs_safe_logger.Logger(os.path.join(FLAGS.log_path, FLAGS.experiment_name) + ".log")
 
+
     # Select data format.
     if FLAGS.data_type == "bl":
         data_manager = load_boolean_data
@@ -275,6 +276,7 @@ def run(only_forward=False):
         eval_iterators.append((filename, eval_it))
 
     # Choose model.
+    model_specific_params = {}
     logger.Log("Building model.")
     if FLAGS.model_type == "CBOW":
         model_module = spinn.cbow
@@ -290,6 +292,8 @@ def run(only_forward=False):
         model_module = spinn.gen_spinn
     elif FLAGS.model_type == "ATTSPINN":
         model_module = spinn.att_spinn
+        model_specific_params['using_diff_in_mlstm'] = FLAGS.using_diff_in_mlstm
+        model_specific_params['using_prod_in_mlstm'] = FLAGS.using_prod_in_mlstm
     else:
         raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
 
@@ -335,6 +339,7 @@ def run(only_forward=False):
          rl_weight=FLAGS.rl_weight,
          predict_leaf=FLAGS.predict_leaf,
          gen_h=FLAGS.gen_h,
+         model_specific_params=model_specific_params,
         )
 
     # Build optimizer.
@@ -755,6 +760,10 @@ if __name__ == '__main__':
     gflags.DEFINE_integer("ckpt_interval_steps", 5000, "Update the checkpoint on disk at this interval.")
     gflags.DEFINE_boolean("ckpt_on_best_dev_error", True, "If error on the first eval set (the dev set) is "
         "at most 0.99 of error at the previous checkpoint, save a special 'best' checkpoint.")
+
+    # Attention model settings
+    gflags.DEFINE_boolean("using_diff_in_mlstm", False, "use (ak - hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
+    gflags.DEFINE_boolean("using_prod_in_mlstm", False, "use (ak * hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
 
     # Evaluation settings
     gflags.DEFINE_boolean("expanded_eval_only_mode", False,

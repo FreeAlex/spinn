@@ -11,6 +11,7 @@ from spinn.util.blocks import Embed, MLP
 from fat_stack import SPINN
 from itertools import izip
 import math
+import logging
 
 class SentencePairTrainer():
     """
@@ -142,6 +143,17 @@ class AttentionModel(nn.Module):
         super(AttentionModel, self).__init__()
         self.hidden_dim = args.size #
         self.matching_input_size = self.hidden_dim * 2
+        self.using_diff_in_mlstm = args.using_diff_in_mlstm
+        self.using_prod_in_mlstm = args.using_prod_in_mlstm
+        if args.using_diff_in_mlstm:
+            # this parameter controls whether using diff as input features in matching lstm
+            logging.info('using diff as input feature in matching lstm')
+            self.matching_input_size += self.hidden_dim
+
+        if args.using_prod_in_mlstm:
+            logging.info('using prod as input feature in matching lstm')
+            self.matching_input_size += self.hidden_dim
+
         # matching LSTM
         self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim, bias=True)
         # attention model, no need to explicitly move parameters to gpu, it is done in fat_classifier.py
@@ -214,7 +226,7 @@ class AttentionModel(nn.Module):
                     hks.append(hk)
                     hmk_x.append(hmk_buffer[i])
                     cmk_x.append(cmk_buffer[i])
-                    indexes.append(i)
+                    indexes.append(i)   # keep index
                     pstack.append(premise_stacks[i])
 
             mbatch_size = len(indexes)
@@ -222,14 +234,21 @@ class AttentionModel(nn.Module):
             hks = torch.stack(hks, 0)
             hmk_x = torch.stack(hmk_x, 0)
             cmk_x = torch.stack(cmk_x, 0)
-
             assert hks.size() == (mbatch_size, self.hidden_dim)
             assert hmk_x.size() == (mbatch_size, self.hidden_dim)
             assert cmk_x.size() == (mbatch_size, self.hidden_dim)
 
             aks = self.attention_vector(pstack, hks, hmk_x)
-            assert aks.size(1) == self.hidden_dim
-            mks = torch.cat([aks, hks], 1)
+            assert aks.size() == (mbatch_size, self.hidden_dim)
+
+            # constructing input for matching lstm
+            mks = [aks, hks]
+            if self.using_diff_in_mlstm:
+                mks.append(aks - hks)
+            if self.using_prod_in_mlstm:
+                mks.append(aks * hks)
+            mks = torch.cat(mks, 1)
+            # doing matching lstm for one step
             hmk_x, cmk_x = self.matching_lstm(mks, hmk_x, cmk_x)
             for i, index in enumerate(indexes):
                 hmk_buffer[index] = hmk_x[i]
@@ -264,6 +283,7 @@ class SentencePairModel(nn.Module):
                  use_product_feature=False,
                  num_mlp_layers=None,
                  mlp_bn=None,
+                 model_specific_params={},
                  **kwargs
                 ):
         super(SentencePairModel, self).__init__()
@@ -295,6 +315,8 @@ class SentencePairModel(nn.Module):
         args.size = model_dim/2
         args.tracker_size = tracking_lstm_hidden_dim
         args.transition_weight = transition_weight
+        args.using_diff_in_mlstm = model_specific_params['using_diff_in_mlstm']
+        args.using_prod_in_mlstm = model_specific_params['using_prod_in_mlstm']
 
         vocab = Vocab()
         vocab.size = initial_embeddings.shape[0] if initial_embeddings is not None else vocab_size
