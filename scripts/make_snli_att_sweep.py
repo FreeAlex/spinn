@@ -24,6 +24,7 @@ gflags.DEFINE_integer("mem", 12, "memory should be used for hpc")
 gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn/python', 'the model path so that spinn can run')
 gflags.DEFINE_bool("using_diff_in_mlstm", True, 'wether or not use diff feature in mlstm')
 gflags.DEFINE_bool('using_prod_in_mlstm', True, 'wether or not use prod feature in mlstm')
+gflags.DEFINE_bool('using_null_in_attention', True, 'wether using null vector in attention, so that weights can assign to null vector')
 FLAGS(sys.argv)
 
 # Instructions: Configure the variables in this block, then run
@@ -58,6 +59,8 @@ if FLAGS.using_diff_in_mlstm:
     FIXED_PARAMETERS['using_diff_in_mlstm'] = ''
 if FLAGS.using_prod_in_mlstm:
     FIXED_PARAMETERS['using_prod_in_mlstm'] = ''
+if FLAGS.using_null_in_attention:
+    FIXED_PARAMETERS['using_null_in_attention'] = ''
 
 # Tunable parameters.
 SWEEP_PARAMETERS = {
@@ -140,10 +143,14 @@ def print_sweep_params():
 print_script_head()
 
 for exp_name in exp_names:
-    print '# first setting'
+    print 'echo running experiment {}'.format(exp_name)
     print 'python -m spinn.models.fat_classifier  --noshow_progress_bar --gpu 0 \\'
     print ' --experiment_name {} \\'.format(exp_name)
     print_fixed_params()
     print_sweep_params()
     print ' & \\'
     print '\n\n'
+
+print '\n'
+print 'echo waiting'
+print 'wait'
