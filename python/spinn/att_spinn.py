@@ -13,13 +13,15 @@ from itertools import izip
 import math
 import logging
 
+logger = logging.getLogger("spinn.attention")
+
 class SentencePairTrainer():
     """
     required by the framework, fat_classifier.py @291,295
     init as classifier_trainer at fat_classifier.py @337
     """
     def __init__(self, model, optimizer):
-        print 'attspinn trainer init'
+        logger.info('attspinn trainer init')
         self.model = model
         self.optimizer = optimizer
 
@@ -46,7 +48,7 @@ class SentencePairTrainer():
 class SPINNAttExt(SPINN):
 
     def __init__(self, args, vocab, use_skips):
-        print 'SPINNAttExt init...'
+        logger.info('SPINNAttExt init...')
         super(SPINNAttExt, self).__init__(args, vocab, use_skips)
         self.hidden_dim = args.size
         self.states = [] # only support one example now, premise and hypothesis
@@ -145,15 +147,16 @@ class AttentionModel(nn.Module):
         self.matching_input_size = self.hidden_dim * 2
         self.using_diff_in_mlstm = args.using_diff_in_mlstm
         self.using_prod_in_mlstm = args.using_prod_in_mlstm
+        self.using_null_in_attention = args.using_null_in_attention
         if args.using_diff_in_mlstm:
             # this parameter controls whether using diff as input features in matching lstm
-            logging.info('using diff as input feature in matching lstm')
+            logger.info('using diff as input feature in matching lstm')
             self.matching_input_size += self.hidden_dim
-
         if args.using_prod_in_mlstm:
-            logging.info('using prod as input feature in matching lstm')
+            logger.info('using prod as input feature in matching lstm')
             self.matching_input_size += self.hidden_dim
-
+        if args.using_null_in_attention:
+            logger.info('using null in attention model')
         # matching LSTM
         self.matching_lstm_unit = LSTMCell(self.matching_input_size, self.hidden_dim, bias=True)
         # attention model, no need to explicitly move parameters to gpu, it is done in fat_classifier.py
@@ -161,7 +164,8 @@ class AttentionModel(nn.Module):
         self.weight_premise = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         self.weight_hypothesis = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
         self.weight_matching = Parameter(torch.Tensor(self.hidden_dim, self.hidden_dim))
-        print 'AttentionModel init'
+        self.null_vector = Parameter(torch.Tensor(1, self.hidden_dim))
+        logger.info('AttentionModel init')
         self.reset_parameters()
 
     def matching_lstm(self, mk, hmkx, cmkx):
@@ -182,6 +186,8 @@ class AttentionModel(nn.Module):
 
         aks = []
         for i, ps in enumerate(pstacks):
+            if self.using_null_in_attention:
+                ps = torch.cat([self.null_vector, ps], 0)
             fe_hi = torch.stack([fe_h[i]] * ps.size(0), 0)
             fe_mi = torch.stack([fe_m[i]] * ps.size(0), 0)
             fe_pi = F.linear(ps, self.weight_premise)
@@ -287,7 +293,7 @@ class SentencePairModel(nn.Module):
                  **kwargs
                 ):
         super(SentencePairModel, self).__init__()
-        print 'ATTSPINN SentencePairModel init...'
+        logger.info('ATTSPINN SentencePairModel init...')
         # self.use_sentence_pair = use_sentence_pair
         self.use_difference_feature = use_difference_feature
         self.use_product_feature = use_product_feature
@@ -317,6 +323,7 @@ class SentencePairModel(nn.Module):
         args.transition_weight = transition_weight
         args.using_diff_in_mlstm = model_specific_params['using_diff_in_mlstm']
         args.using_prod_in_mlstm = model_specific_params['using_prod_in_mlstm']
+        args.using_null_in_attention = model_specific_params['using_null_in_attention']
 
         vocab = Vocab()
         vocab.size = initial_embeddings.shape[0] if initial_embeddings is not None else vocab_size

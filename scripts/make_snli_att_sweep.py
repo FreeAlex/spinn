@@ -8,10 +8,6 @@ import numpy as np
 import gflags
 import sys
 
-NYU_NON_PBS = False
-NAME = "ENC"
-SWEEP_RUNS = 1
-
 LIN = "LIN"
 EXP = "EXP"
 SS_BASE = "SS_BASE"
@@ -21,8 +17,13 @@ FLAGS = gflags.FLAGS
 gflags.DEFINE_string("training_data_path", "/home/xz1364/mlworkspace/snli_1.0/snli_1.0_train.jsonl", "")
 gflags.DEFINE_string("eval_data_path", "/home/xz1364/mlworkspace/snli_1.0/snli_1.0_dev.jsonl", "")
 gflags.DEFINE_string("embedding_data_path", "/home/xz1364/mlworkspace/glove/glove.840B.300d.txt", "")
-gflags.DEFINE_string("log_path", "/home/xz1364/logs", "")
-
+gflags.DEFINE_string("log_path", ".", "")
+gflags.DEFINE_string("exp_names", 'exp1,exp2', "experiment names, seperate by coma(,)")
+gflags.DEFINE_string("slurm_name", 'att-0', 'the file name of slurm output and err file')
+gflags.DEFINE_integer("mem", 12, "memory should be used for hpc")
+gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn/python', 'the model path so that spinn can run')
+gflags.DEFINE_bool("using_diff_in_mlstm", True, 'wether or not use diff feature in mlstm')
+gflags.DEFINE_bool('using_prod_in_mlstm', True, 'wether or not use prod feature in mlstm')
 FLAGS(sys.argv)
 
 # Instructions: Configure the variables in this block, then run
@@ -49,13 +50,14 @@ FIXED_PARAMETERS = {
     "eval_seq_length":  "150",
     "eval_interval_steps": "1000",
     "statistics_interval_steps": "1000",
-    # "use_internal_parser": "",    # use gold parser
     "batch_size":  "64",
-    # "use_encode": "",
-    # "encode_reverse": "",
-    # "noencode_bidirectional": "",
     "num_mlp_layers": "2",
 }
+# deal with confiurable fixed parameters
+if FLAGS.using_diff_in_mlstm:
+    FIXED_PARAMETERS['using_diff_in_mlstm'] = ''
+if FLAGS.using_prod_in_mlstm:
+    FIXED_PARAMETERS['using_prod_in_mlstm'] = ''
 
 # Tunable parameters.
 SWEEP_PARAMETERS = {
@@ -64,25 +66,46 @@ SWEEP_PARAMETERS = {
     "semantic_classifier_keep_rate": ("skr", LIN, 0.7, 0.95),  # NB: Keep rates may depend considerably on dims.
     "embedding_keep_rate": ("ekr", LIN, 0.7, 0.95),
     "learning_rate_decay_per_10k_steps": ("dec", EXP, 0.5, 1.0),
-    # "tracking_lstm_hidden_dim": ("tdim", EXP, 24, 128),
-    # "transition_weight":  ("trwt", EXP, 0.5, 4.0),
 }
 
-sweep_name = "sweep_" + NAME + "_" + \
-    FIXED_PARAMETERS["data_type"] + "_" + FIXED_PARAMETERS["model_type"]
+exp_names = FLAGS.exp_names.split(',')
 
-# - #
-print "# NAME: " + sweep_name
-print "# NUM RUNS: " + str(SWEEP_RUNS)
-print "# SWEEP PARAMETERS: " + str(SWEEP_PARAMETERS)
-print "# FIXED_PARAMETERS: " + str(FIXED_PARAMETERS)
-print
 
-for run_id in range(SWEEP_RUNS):
+def print_script_head():
+    print '''
+#!/bin/sh
+
+# Generic job script for all experiments.
+
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+'''
+    print '#SBATCH --mem={}GB'.format(FLAGS.mem)
+    print '#SBATCH --output=slurm-{}-%j.out'.format(FLAGS.slurm_name)
+    print '#SBATCH --error=slurm-{}-%j.err'.format(FLAGS.slurm_name)
+    print '#SBATCH --job-name={}'.format(FLAGS.slurm_name)
+    print '\n'
+    print "# SWEEP PARAMETERS: " + str(SWEEP_PARAMETERS)
+    print "# FIXED_PARAMETERS: " + str(FIXED_PARAMETERS)
+    print '''
+# Make sure we have access to HPC-managed libraries.
+module load python/intel/2.7.12 pytorch/intel/20170226 protobuf/intel/3.1.0
+# Make sure the required pacage has been installed
+pip install --user python-gflags==2.0
+    '''
+    print 'export PYTHONPATH=$PYTHONPATH:{}'.format(FLAGS.spinn_path)
+    print '\n'
+
+def print_fixed_params():
+    params = FIXED_PARAMETERS
+    for param in params:
+        value = params[param]
+        print " --" + param + " " + str(value) + " \\"
+
+def print_sweep_params():
     params = {}
-    name = sweep_name + "_" + str(run_id)
 
-    params.update(FIXED_PARAMETERS)
     for param in SWEEP_PARAMETERS:
         config = SWEEP_PARAMETERS[param]
         t = config[1]
@@ -94,7 +117,7 @@ for run_id in range(SWEEP_RUNS):
             lmn = np.log(mn)
             lmx = np.log(mx)
             sample = np.exp(lmn + (lmx - lmn) * r)
-        elif t==SS_BASE:
+        elif t == SS_BASE:
             lmn = np.log(mn)
             lmx = np.log(mx)
             sample = 1 - np.exp(lmn + (lmx - lmn) * r)
@@ -108,17 +131,19 @@ for run_id in range(SWEEP_RUNS):
             val_disp = "%.2g" % sample
 
         params[param] = sample
-        name += "-" + config[0] + val_disp
 
-    flags = ""
     for param in params:
         value = params[param]
-        val_str = ""
-        flags += " --" + param + " " + str(value)
+        print " --" + param + " " + str(value) + " \\"
 
-    flags += " --experiment_name " + name
-    if NYU_NON_PBS:
-        print "cd spinn/python; python2.7 -m spinn.models.fat_classifier " + flags
-    else:
-        print "SPINN_FLAGS=\"" + flags + "\" bash ../scripts/sbatch_submit.sh"
-    print
+
+print_script_head()
+
+for exp_name in exp_names:
+    print '# first setting'
+    print 'python -m spinn.models.fat_classifier  --noshow_progress_bar --gpu 0 \\'
+    print ' --experiment_name {} \\'.format(exp_name)
+    print_fixed_params()
+    print_sweep_params()
+    print ' & \\'
+    print '\n\n'

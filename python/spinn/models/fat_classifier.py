@@ -53,6 +53,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 
+import logging
 
 FLAGS = gflags.FLAGS
 
@@ -294,6 +295,13 @@ def run(only_forward=False):
         model_module = spinn.att_spinn
         model_specific_params['using_diff_in_mlstm'] = FLAGS.using_diff_in_mlstm
         model_specific_params['using_prod_in_mlstm'] = FLAGS.using_prod_in_mlstm
+        model_specific_params['using_null_in_attention'] = FLAGS.using_null_in_attention
+        attlogger = logging.getLogger('spinn.attention')
+        attlogger.setLevel(logging.INFO)
+        fh = logging.FileHandler(os.path.join(FLAGS.log_path, '{}.att.log'.format(FLAGS.experiment_name)))
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+        attlogger.addHandler(fh)
     else:
         raise Exception("Requested unimplemented model type %s" % FLAGS.model_type)
 
@@ -764,6 +772,7 @@ if __name__ == '__main__':
     # Attention model settings
     gflags.DEFINE_boolean("using_diff_in_mlstm", False, "use (ak - hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
     gflags.DEFINE_boolean("using_prod_in_mlstm", False, "use (ak * hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
+    gflags.DEFINE_boolean("using_null_in_attention", False, "use null vector in premise stack so that some weights can be assigned")
 
     # Evaluation settings
     gflags.DEFINE_boolean("expanded_eval_only_mode", False,
