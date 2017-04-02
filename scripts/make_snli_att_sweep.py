@@ -20,7 +20,7 @@ gflags.DEFINE_string("embedding_data_path", "/home/xz1364/mlworkspace/glove/glov
 gflags.DEFINE_string("log_path", ".", "")
 gflags.DEFINE_string("exp_names", 'exp1,exp2', "experiment names, seperate by coma(,)")
 gflags.DEFINE_string("slurm_name", 'att-0', 'the file name of slurm output and err file')
-gflags.DEFINE_integer("mem", 12, "memory should be used for hpc")
+gflags.DEFINE_integer("mem", 8, "memory should be used for hpc for each task")
 gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn/python', 'the model path so that spinn can run')
 gflags.DEFINE_bool("using_diff_in_mlstm", True, 'wether or not use diff feature in mlstm')
 gflags.DEFINE_bool('using_prod_in_mlstm', True, 'wether or not use prod feature in mlstm')
@@ -75,16 +75,16 @@ exp_names = FLAGS.exp_names.split(',')
 
 
 def print_script_head():
-    print '''
-#!/bin/sh
+    print '''#!/bin/sh
 
 # Generic job script for all experiments.
 
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
+#SBATCH --reservation=mhealth
 '''
-    print '#SBATCH --mem={}GB'.format(FLAGS.mem)
+    print '#SBATCH --mem={}GB'.format(FLAGS.mem * len(exp_names))
     print '#SBATCH --output=slurm-{}-%j.out'.format(FLAGS.slurm_name)
     print '#SBATCH --error=slurm-{}-%j.err'.format(FLAGS.slurm_name)
     print '#SBATCH --job-name={}'.format(FLAGS.slurm_name)

@@ -45,6 +45,7 @@ import spinn.fat_stack
 import spinn.plain_rnn
 import spinn.cbow
 import spinn.att_spinn
+from itertools import izip
 
 # PyTorch
 import torch
@@ -54,6 +55,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 import logging
+import json
 
 FLAGS = gflags.FLAGS
 
@@ -106,10 +108,25 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
             eval_X_batch, eval_transitions_batch = truncate(
                 eval_X_batch, eval_transitions_batch, eval_num_transitions_batch)
 
+        if FLAGS.saving_eval_attention_matrix:
+            model.set_recording_attention_weight_matrix(True)
+
         # Run model.
         output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
             use_internal_parser=FLAGS.use_internal_parser,
-            validate_transitions=FLAGS.validate_transitions)
+            validate_transitions=FLAGS.validate_transitions,)
+
+        if FLAGS.saving_eval_attention_matrix:
+            # WARNING: only attention SPINN model have attention matrix
+            attention_matrix = model.get_attention_matrix_from_last_forward()
+            with open(os.path.join(FLAGS.metrics_path, FLAGS.experiment_name, 'attention-matrix-{}.txt'.format(step)), 'a') as txtfile:
+                for eval_id, attmat in izip(eval_ids, attention_matrix):
+                    txtfile.write('{}\n'.format(eval_id))
+                    txtfile.write('{},{}\n'.format(len(attmat), len(attmat[0])))
+                    for row in attmat:
+                        txtfile.write(','.join(['{:.1f}'.format(x*100.0) for x in row]))
+                        txtfile.write('\n')
+            model.set_recording_attention_weight_matrix(False) # reset it after run
 
         # Normalize output.
         logits = F.log_softmax(output)
@@ -773,6 +790,7 @@ if __name__ == '__main__':
     gflags.DEFINE_boolean("using_diff_in_mlstm", False, "use (ak - hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
     gflags.DEFINE_boolean("using_prod_in_mlstm", False, "use (ak * hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
     gflags.DEFINE_boolean("using_null_in_attention", False, "use null vector in premise stack so that some weights can be assigned")
+    gflags.DEFINE_boolean("saving_eval_attention_matrix", False, "Whether to save the attention matrix when evaluation")
 
     # Evaluation settings
     gflags.DEFINE_boolean("expanded_eval_only_mode", False,

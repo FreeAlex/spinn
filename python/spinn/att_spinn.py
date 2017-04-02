@@ -168,6 +168,15 @@ class AttentionModel(nn.Module):
         logger.info('AttentionModel init')
         self.reset_parameters()
 
+    def set_recording_attention_weight_matrix(self, flag=True):
+        self.recording_attention_weight_matrix = flag
+
+    def get_recording_attention_weight_matrix(self):
+        if hasattr(self, 'recording_attention_weight_matrix'):
+            return self.recording_attention_weight_matrix
+        else:
+            return False
+
     def matching_lstm(self, mk, hmkx, cmkx):
         hmky, cmky = self.matching_lstm_unit(mk, (hmkx, cmkx))
         return hmky, cmky
@@ -185,6 +194,9 @@ class AttentionModel(nn.Module):
         assert fe_m.size() == (batch_size, self.hidden_dim)
 
         aks = []
+        if self.get_recording_attention_weight_matrix():
+            # init
+            self.temp_attweight_record = []
         for i, ps in enumerate(pstacks):
             if self.using_null_in_attention:
                 ps = torch.cat([self.null_vector, ps], 0)
@@ -192,7 +204,10 @@ class AttentionModel(nn.Module):
             fe_mi = torch.stack([fe_m[i]] * ps.size(0), 0)
             fe_pi = F.linear(ps, self.weight_premise)
             ek = F.tanh(fe_pi + fe_hi + fe_mi).mv(self.w_e)
+            # keep attweight vector
             ek = F.softmax(ek)
+            if self.get_recording_attention_weight_matrix():
+                self.temp_attweight_record.append(ek.data.numpy().tolist())
             ak = ps.t().mv(ek)
             assert ak.size() == (self.hidden_dim,)
             assert len(aks) == i
@@ -209,6 +224,11 @@ class AttentionModel(nn.Module):
     def forward(self, premise_stacks, hypothesis_stacks):
         # return batch of matching hidden vectors
         assert len(premise_stacks) == len(hypothesis_stacks)
+
+        if self.get_recording_attention_weight_matrix():
+            # whether to keep recording attention weight matrix in forward
+            self.attention_weight_matrix = [['n/a'] * len(hs) for hs in hypothesis_stacks]
+
         batch_size = len(hypothesis_stacks)
         sentence_lens = [len(hs) for hs in hypothesis_stacks]
         count = [0] * batch_size
@@ -260,6 +280,12 @@ class AttentionModel(nn.Module):
                 hmk_buffer[index] = hmk_x[i]
                 cmk_buffer[index] = cmk_x[i]
                 count[index] += 1
+            if self.get_recording_attention_weight_matrix():
+                for i, index in enumerate(indexes):
+                    j = stepi - (num_steps - sentence_lens[index])
+                    self.attention_weight_matrix[index][j] = self.temp_attweight_record[i]
+
+
         hmk_final = torch.stack(hmk_buffer)
         assert count == sentence_lens
         return hmk_final
@@ -396,7 +422,8 @@ class SentencePairModel(nn.Module):
 
     def forward(self, sentences, transitions, y_batch=None,
                 use_internal_parser=False, validate_transitions=True):
-        example = self.build_example(sentences, transitions)
+
+        example = self.build_example(sentences, transitions)    # example = [premises, hypothesis]
 
         b, l = example.tokens.size()[:2]
 
@@ -450,6 +477,12 @@ class SentencePairModel(nn.Module):
         features = torch.cat(features, 1) # D0 -> batch, D1 -> representation vector
         return features
 
+    def set_recording_attention_weight_matrix(self, flag=True):
+        self.attention.set_recording_attention_weight_matrix(flag)
+
+    def get_attention_matrix_from_last_forward(self):
+        return self.attention.attention_weight_matrix
+
 
 
 class SentenceModel(nn.Module):
@@ -460,5 +493,8 @@ class SentenceModel(nn.Module):
     """
     def __init__(self):
         raise Exception("")
+
+
+
 
 
