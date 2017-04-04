@@ -58,7 +58,7 @@ def plot_snli_attention_matrix(args):
     plt.ylabel('premise')
     plt.tight_layout()
     if args.save_dir:
-        plt.savefig(os.path.join(args.save_dir, '{}.png'.format(id)))
+        plt.savefig(os.path.join(args.save_dir, '{}-{}.png'.format(id, args.suffix)))
     else:
         plt.show()
 
@@ -71,6 +71,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='snli')
     parser.add_argument('--index', type=int, default=-1, help='the index of sentence to plot, -1: pick randomly')
     parser.add_argument('--save_dir', type=str, default=None)
+    parser.add_argument('--suffix', type=str, default='')
 
     args = parser.parse_args()
 
