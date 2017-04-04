@@ -324,16 +324,21 @@ class SentencePairModel(nn.Module):
         # self.use_sentence_pair = use_sentence_pair
         self.use_difference_feature = use_difference_feature
         self.use_product_feature = use_product_feature
+        self.using_only_mlstm_feature = model_specific_params['using_only_mlstm_feature']
 
         self.hidden_dim = hidden_dim = model_dim / 2
         # features_dim = hidden_dim * 2 if use_sentence_pair else hidden_dim
-        features_dim = model_dim
-
-        # [premise, hypothesis, diff, product]
-        if self.use_difference_feature:
-            features_dim += self.hidden_dim
-        if self.use_product_feature:
-            features_dim += self.hidden_dim
+        features_dim = hidden_dim
+        if not self.using_only_mlstm_feature:
+            logger.info('using not only matching lstm feature')
+            features_dim += hidden_dim
+            # [premise, hypothesis, diff, product]
+            if self.use_difference_feature:
+                logger.info('using diff feature in MLP')
+                features_dim += self.hidden_dim
+            if self.use_product_feature:
+                logging.info('using prod feature in MLP')
+                features_dim += self.hidden_dim
 
         mlp_input_dim = features_dim
 
@@ -470,11 +475,13 @@ class SentencePairModel(nn.Module):
         assert h_ks.size(1) == self.hidden_dim
         assert h_m.size(1) == self.hidden_dim
 
-        features = [h_ks, h_m]
-        if self.use_difference_feature:
-            features.append(h_ks - h_m)
-        if self.use_product_feature:
-            features.append(h_ks * h_m)
+        features = [h_m]
+        if not self.using_only_mlstm_feature:
+            features.append(h_ks)
+            if self.use_difference_feature:
+                features.append(h_ks - h_m)
+            if self.use_product_feature:
+                features.append(h_ks * h_m)
         features = torch.cat(features, 1) # D0 -> batch, D1 -> representation vector
         return features
 
