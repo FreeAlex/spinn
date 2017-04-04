@@ -207,7 +207,8 @@ class AttentionModel(nn.Module):
             # keep attweight vector
             ek = F.softmax(ek)
             if self.get_recording_attention_weight_matrix():
-                self.temp_attweight_record.append(ek.data.numpy().tolist())
+                data = ek.data.cpu()
+                self.temp_attweight_record.append(data.numpy().tolist())
             ak = ps.t().mv(ek)
             assert ak.size() == (self.hidden_dim,)
             assert len(aks) == i
