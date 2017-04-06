@@ -44,7 +44,8 @@ def plot_snli_attention_matrix(args):
     matrix = np.array(att['matrix']).transpose()  # premise by hypothesis
     stackp = get_parser_stack(example['premise_tokens'], example['premise_transitions'])
     stackh = get_parser_stack(example['hypothesis_tokens'], example['hypothesis_transitions'])
-
+    if len(stackp) + 1 == matrix.shape[0]:
+        stackp.insert(0, 'NULL')
     # plot
     fig = plt.figure()
     ax = fig.add_subplot(111)
@@ -58,7 +59,7 @@ def plot_snli_attention_matrix(args):
     plt.ylabel('premise')
     plt.tight_layout()
     if args.save_dir:
-        plt.savefig(os.path.join(args.save_dir, '{}-{}.png'.format(id, args.suffix)))
+        plt.savefig(os.path.join(args.save_dir, '{}{}.png'.format(id, args.suffix)))
     else:
         plt.show()
 
