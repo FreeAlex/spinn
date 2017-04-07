@@ -59,7 +59,7 @@ def plot_snli_attention_matrix(args):
     plt.ylabel('premise')
     plt.tight_layout()
     if args.save_dir:
-        plt.savefig(os.path.join(args.save_dir, '{}{}.png'.format(id, args.suffix)))
+        plt.savefig(os.path.join(args.save_dir, '{}-{}{}.png'.format(index, id, args.suffix)))
     else:
         plt.show()
 
