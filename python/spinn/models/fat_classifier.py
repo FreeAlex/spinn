@@ -128,6 +128,8 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
                         txtfile.write('\n')
             model.set_recording_attention_weight_matrix(False) # reset it after run
 
+
+
         # Normalize output.
         logits = F.log_softmax(output)
 

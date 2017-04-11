@@ -451,8 +451,12 @@ class SentencePairModel(nn.Module):
         # Premise stack & hypothesis stack
         ps, hs, transition_acc, transition_loss = self.run_spinn(example, use_internal_parser, validate_transitions)
 
-        self.transition_acc = transition_acc
-        self.transition_loss = transition_loss
+        if use_internal_parser:
+            self.transition_acc = transition_acc
+            self.transition_loss = transition_loss
+        else:
+            assert transition_acc is None or transition_acc == 0, transition_acc
+            assert transition_loss is None or transition_loss == 0, transition_loss
 
         # attention model
         h_m = self.attention(ps, hs)    # matching matrix batch_size * hidden_dim
