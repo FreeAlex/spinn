@@ -316,6 +316,7 @@ def run(only_forward=False):
         model_specific_params['using_prod_in_mlstm'] = FLAGS.using_prod_in_mlstm
         model_specific_params['using_null_in_attention'] = FLAGS.using_null_in_attention
         model_specific_params['using_only_mlstm_feature'] = FLAGS.using_only_mlstm_feature
+        model_specific_params['using_dual_attention'] = FLAGS.using_dual_attention
         attlogger = logging.getLogger('spinn.attention')
         attlogger.setLevel(logging.INFO)
         fh = logging.FileHandler(os.path.join(FLAGS.log_path, '{}.att.log'.format(FLAGS.experiment_name)))
@@ -795,7 +796,7 @@ if __name__ == '__main__':
     gflags.DEFINE_boolean("using_null_in_attention", False, "use null vector in premise stack so that some weights can be assigned")
     gflags.DEFINE_boolean("saving_eval_attention_matrix", False, "Whether to save the attention matrix when evaluation")
     gflags.DEFINE_boolean("using_only_mlstm_feature", False, "Whether to use only matching lstm as the feature input in MLP")
-
+    gflags.DEFINE_boolean('using_dual_attention', False, "Whether to use dual attention in matching lstm")
     # Evaluation settings
     gflags.DEFINE_boolean("expanded_eval_only_mode", False,
         "If set, a checkpoint is loaded and a forward pass is done to get the predicted "

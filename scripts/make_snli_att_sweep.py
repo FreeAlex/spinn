@@ -19,14 +19,15 @@ gflags.DEFINE_string("training_data_path", "/home/xz1364/mlworkspace/snli_1.0/sn
 gflags.DEFINE_string("eval_data_path", "/home/xz1364/mlworkspace/snli_1.0/snli_1.0_dev.jsonl", "")
 gflags.DEFINE_string("embedding_data_path", "/home/xz1364/mlworkspace/glove/glove.840B.300d.txt", "")
 gflags.DEFINE_string("log_path", ".", "")
-gflags.DEFINE_string("exp_names", 'direct-6,direct-7', "experiment names, seperate by coma(,)")
-gflags.DEFINE_string("slurm_name", 'direct-6-7', 'the file name of slurm output and err file')
+gflags.DEFINE_string("exp_names", 'dual-0', "experiment names, seperate by coma(,)")
+gflags.DEFINE_string("slurm_name", 'dual-0', 'the file name of slurm output and err file')
 gflags.DEFINE_integer("mem", 10, "memory should be used for hpc for each task")
 gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn-dev3/python', 'the model path so that spinn can run')
 gflags.DEFINE_bool("using_diff_in_mlstm", True, 'wether or not use diff feature in mlstm')
 gflags.DEFINE_bool('using_prod_in_mlstm', True, 'wether or not use prod feature in mlstm')
 gflags.DEFINE_bool('using_null_in_attention', True, 'wether using null vector in attention, so that weights can assign to null vector')
-gflags.DEFINE_bool('using_only_mlstm_feature', True, 'wether using only mlstm feature in final represenation')
+gflags.DEFINE_bool('using_only_mlstm_feature', False, 'wether using only mlstm feature in final represenation')
+gflags.DEFINE_bool('using_dual_attention', True, 'wether using dual attention')
 gflags.DEFINE_bool('gpu', True, 'wether use GPU or not')
 FLAGS(sys.argv)
 
@@ -56,19 +57,34 @@ FIXED_PARAMETERS = {
     "statistics_interval_steps": "1000",
     "batch_size":  "64",
     "num_mlp_layers": "2",
+    "use_difference_feature": "",
+    "use_product_feature": "",
 }
 # deal with confiurable fixed parameters
 if FLAGS.using_diff_in_mlstm:
     FIXED_PARAMETERS['using_diff_in_mlstm'] = ''
+else:
+    FIXED_PARAMETERS['nousing_diff_in_mlstm'] = ''
+
 if FLAGS.using_prod_in_mlstm:
     FIXED_PARAMETERS['using_prod_in_mlstm'] = ''
+else:
+    FIXED_PARAMETERS['nousing_prod_in_mlstm'] = ''
+
 if FLAGS.using_null_in_attention:
     FIXED_PARAMETERS['using_null_in_attention'] = ''
+else:
+    FIXED_PARAMETERS['nousing_null_in_attention'] = ''
 
 if FLAGS.using_only_mlstm_feature:
     FIXED_PARAMETERS['using_only_mlstm_feature'] = ''
 else:
     FIXED_PARAMETERS['nousing_only_mlstm_feature'] = ''
+
+if FLAGS.using_dual_attention:
+    FIXED_PARAMETERS['using_dual_attention'] = ''
+else:
+    FIXED_PARAMETERS['nousing_dual_attention'] = ''
 
 # Tunable parameters.
 SWEEP_PARAMETERS = {
@@ -77,10 +93,9 @@ SWEEP_PARAMETERS = {
     "semantic_classifier_keep_rate": ("skr", LIN, 0.7, 0.95),  # NB: Keep rates may depend considerably on dims.
     "embedding_keep_rate": ("ekr", LIN, 0.7, 0.95),
     "learning_rate_decay_per_10k_steps": ("dec", EXP, 0.5, 1.0),
-    'mlp_dim': ('mlpd', SS_SET, [256, 512, 1024], 0),   # 0 is useless
-    'model_dim': ('mdim', SS_SET, [300, 400, 600], 0),  # 0 is useless
-    'num_mlp_layers': ('mlpl', SS_SET, [1,2], 0),
-
+    # 'mlp_dim': ('mlpd', SS_SET, [512], 0),   # 0 is useless
+    # 'model_dim': ('mdim', SS_SET, [300, 600], 0),  # 0 is useless
+    # 'num_mlp_layers': ('mlpl', SS_SET, [1, 2], 0),
 }
 
 exp_names = FLAGS.exp_names.split(',')

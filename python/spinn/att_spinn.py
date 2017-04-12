@@ -168,15 +168,6 @@ class AttentionModel(nn.Module):
         logger.info('AttentionModel init')
         self.reset_parameters()
 
-    def set_recording_attention_weight_matrix(self, flag=True):
-        self.recording_attention_weight_matrix = flag
-
-    def get_recording_attention_weight_matrix(self):
-        if hasattr(self, 'recording_attention_weight_matrix'):
-            return self.recording_attention_weight_matrix
-        else:
-            return False
-
     def matching_lstm(self, mk, hmkx, cmkx):
         hmky, cmky = self.matching_lstm_unit(mk, (hmkx, cmkx))
         return hmky, cmky
@@ -194,9 +185,10 @@ class AttentionModel(nn.Module):
         assert fe_m.size() == (batch_size, self.hidden_dim)
 
         aks = []
-        if self.get_recording_attention_weight_matrix():
+        if hasattr(self, 'attention_weight_matrix'):
             # init
             self.temp_attweight_record = []
+
         for i, ps in enumerate(pstacks):
             if self.using_null_in_attention:
                 ps = torch.cat([self.null_vector, ps], 0)
@@ -204,11 +196,13 @@ class AttentionModel(nn.Module):
             fe_mi = torch.stack([fe_m[i]] * ps.size(0), 0)
             fe_pi = F.linear(ps, self.weight_premise)
             ek = F.tanh(fe_pi + fe_hi + fe_mi).mv(self.w_e)
-            # keep attweight vector
             ek = F.softmax(ek)
-            if self.get_recording_attention_weight_matrix():
+
+            if hasattr(self, 'temp_attweight_record'):
+                # keep attweight vector
                 data = ek.data.cpu()
                 self.temp_attweight_record.append(data.numpy().tolist())
+
             ak = ps.t().mv(ek)
             assert ak.size() == (self.hidden_dim,)
             assert len(aks) == i
@@ -226,7 +220,7 @@ class AttentionModel(nn.Module):
         # return batch of matching hidden vectors
         assert len(premise_stacks) == len(hypothesis_stacks)
 
-        if self.get_recording_attention_weight_matrix():
+        if getattr(self, 'recording_attention', False):
             # whether to keep recording attention weight matrix in forward
             self.attention_weight_matrix = [['n/a'] * len(hs) for hs in hypothesis_stacks]
 
@@ -281,7 +275,7 @@ class AttentionModel(nn.Module):
                 hmk_buffer[index] = hmk_x[i]
                 cmk_buffer[index] = cmk_x[i]
                 count[index] += 1
-            if self.get_recording_attention_weight_matrix():
+            if hasattr(self, 'attention_weight_matrix'):
                 for i, index in enumerate(indexes):
                     j = stepi - (num_steps - sentence_lens[index])
                     self.attention_weight_matrix[index][j] = self.temp_attweight_record[i]
@@ -325,20 +319,34 @@ class SentencePairModel(nn.Module):
         self.use_difference_feature = use_difference_feature
         self.use_product_feature = use_product_feature
         self.using_only_mlstm_feature = model_specific_params['using_only_mlstm_feature']
+        self.using_dual_attention = model_specific_params['using_dual_attention']
 
         self.hidden_dim = hidden_dim = model_dim / 2
-        # features_dim = hidden_dim * 2 if use_sentence_pair else hidden_dim
-        features_dim = hidden_dim
-        if not self.using_only_mlstm_feature:
-            logger.info('using not only matching lstm feature')
-            features_dim += hidden_dim
-            # [premise, hypothesis, diff, product]
+
+        features_dim = 0
+        if self.using_dual_attention:
+            logger.info('using dual attention')
+            features_dim += hidden_dim * 2   # one for the premis mlstm output, one for hypothesis mlstm
             if self.use_difference_feature:
-                logger.info('using diff feature in MLP')
-                features_dim += self.hidden_dim
+                features_dim += hidden_dim
+
             if self.use_product_feature:
-                logging.info('using prod feature in MLP')
-                features_dim += self.hidden_dim
+                features_dim += hidden_dim
+        else:
+            logger.info('using premise to hypothis attention')
+            if self.using_only_mlstm_feature:
+                logger.info('using only matching lstm feature')
+                features_dim += hidden_dim
+            else:
+                logging.info('using matching lstm feature and hypothesis final representation')
+                features_dim += hidden_dim * 2
+                # [premise, hypothesis, diff, product]
+                if self.use_difference_feature:
+                    logger.info('using diff feature in MLP')
+                    features_dim += self.hidden_dim
+                if self.use_product_feature:
+                    logging.info('using prod feature in MLP')
+                    features_dim += self.hidden_dim
 
         mlp_input_dim = features_dim
 
@@ -460,10 +468,20 @@ class SentencePairModel(nn.Module):
 
         # attention model
         h_m = self.attention(ps, hs)    # matching matrix batch_size * hidden_dim
-        assert h_m.size() == (len(ps), self.hidden_dim)
-        # print 'run attention complete'
+        assert h_m.size() == (len(hs), self.hidden_dim)
+        if getattr(self.attention, 'recording_attention', False):
+            self.hypothesis_attention_matrix = self.attention.attention_weight_matrix
 
-        features = self.build_features(hs, h_m)
+        # run dual attention
+        if self.using_dual_attention:
+            p_m = self.attention(hs, ps)
+            assert p_m.size() == (len(ps), self.hidden_dim)
+            if getattr(self.attention, 'recording_attention', False):
+                self.premise_attention_matrix = self.attention.attention_weight_matrix
+            features = self.build_features_dual_attention(p_m, h_m)
+        else:
+            features = self.build_features(hs, h_m)
+
 
         # output layer
         output = self.mlp(features)
@@ -489,11 +507,29 @@ class SentencePairModel(nn.Module):
         features = torch.cat(features, 1) # D0 -> batch, D1 -> representation vector
         return features
 
+    def build_features_dual_attention(self, premise_mlstm, hypothesis_mlstm):
+
+        assert premise_mlstm.size(1) == self.hidden_dim
+        assert hypothesis_mlstm.size(1) == self.hidden_dim
+
+        features = [premise_mlstm, hypothesis_mlstm]
+        if self.use_difference_feature:
+            features.append(premise_mlstm - hypothesis_mlstm)
+
+        if self.use_product_feature:
+            features.append(premise_mlstm * hypothesis_mlstm)
+
+        features = torch.cat(features, 1) # D0 -> batch, D1 -> representation vector
+        return features
+
     def set_recording_attention_weight_matrix(self, flag=True):
-        self.attention.set_recording_attention_weight_matrix(flag)
+        self.attention.recording_attention = flag
 
     def get_attention_matrix_from_last_forward(self):
-        return self.attention.attention_weight_matrix
+        if self.using_dual_attention:
+            return self.hypothesis_attention_matrix, self.premise_attention_matrix
+        else:
+            return self.hypothesis_attention_matrix
 
 
 
