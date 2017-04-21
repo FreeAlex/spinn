@@ -19,7 +19,10 @@ def shrink_fields(args):
 
     with open(args.data_file, 'r') as txtfile, open(args.output, 'w') as csvfile:
         id = 0
-        writer = csv.DictWriter(csvfile, ['id', 'source', 'target', 'relation'])
+        if args.format == 'tsv':
+            writer = csv.DictWriter(csvfile, ['id', 'source', 'target', 'relation'], dialect='excel-tab')
+        elif args.format == 'csv':
+            writer = csv.DictWriter(csvfile, ['id', 'source', 'target', 'relation'])
         writer.writeheader()
         for row in txtfile:
             pair = row.split(' ||| ')
