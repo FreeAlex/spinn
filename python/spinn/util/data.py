@@ -234,11 +234,13 @@ def MakeTrainingIterator(sources, batch_size, smart_batches=True, use_peano=True
             # Group indices from buckets into batches, so that
             # examples in each batch have similar length.
             batch = []
+            assert len(keys) > batch_size
             for i, _ in keys:
                 batch.append(i)
                 if len(batch) == batch_size:
                     batches.append(batch)
                     batch = []
+        assert len(batches) > 0
         return batches
 
     def batch_iter():

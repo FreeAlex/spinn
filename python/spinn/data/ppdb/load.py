@@ -1,5 +1,4 @@
 
-import json
 import codecs
 import csv
 
@@ -11,7 +10,7 @@ LABEL_MAP = {
     "ReverseEntailment": 2,
     "Equivalence": 3,
     "OtherRelated": 4,
-    # "Exclusion": 1,
+    # "Exclusion": 1,    # skiping this label because few samples
 }
 
 def convert_binary_bracketing(parse, lowercase=False):
@@ -31,7 +30,7 @@ def convert_binary_bracketing(parse, lowercase=False):
                 transitions.append(0)
     return tokens, transitions
 
-def load_ppdb(path, lowercase=False, type='tsv', limit=None):
+def load_data(path, lowercase=False, type='tsv', limit=None):
     print "Loading", path
     examples = []
     with codecs.open(path, encoding='utf-8') as f:
@@ -62,5 +61,5 @@ def load_ppdb(path, lowercase=False, type='tsv', limit=None):
 
 if __name__ == "__main__":
     # Demo:
-    examples,_ = load_ppdb('/Users/Alex/Data/ppdb/ppdb2-s-parsed.tsv', limit=10)
+    examples,_ = load_data('/Users/Alex/Data/ppdb/ppdb2-s-parsed.tsv', limit=10)
     print examples[0]
