@@ -16,8 +16,7 @@ logger = logging.getLogger("spinn.attention")
 
 class SentencePairTrainer():
     """
-    required by the framework, fat_classifier.py @291,295
-    init as classifier_trainer at fat_classifier.py @337
+    required by the framework
     """
     def __init__(self, model, optimizer):
         logger.info('attspinn trainer init')
@@ -255,14 +254,6 @@ class SentencePairModel(nn.Module):
 
 
 
-class SentenceModel(nn.Module):
-    """
-    required by the framework, fat_classifier.py@296
-    init as model at fat_classifier.py@300
-    because attention model take two sentences, this model might never be used
-    """
-    def __init__(self):
-        raise Exception("")
 
 
 

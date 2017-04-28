@@ -378,7 +378,6 @@ def run(only_forward=False):
         logger.Log("Resuming at step: {} with best dev accuracy: {}".format(step, 1. - best_dev_error))
     else:
         assert not only_forward, "Can't run an eval-only run without a checkpoint. Supply a checkpoint."
-        step = 0
         best_dev_error = 1.0
 
     # Print model size.
@@ -413,8 +412,6 @@ def run(only_forward=False):
         progress_bar = SimpleProgressBar(msg="Training", bar_length=60, enabled=FLAGS.show_progress_bar)
         progress_bar.step(i=0, total=FLAGS.statistics_interval_steps)
 
-        for step in range(step, FLAGS.training_steps):
-            total_tokens = 0    # total number of tokens
 
             # set training mode, pytorch framework
             model.train()
@@ -424,16 +421,8 @@ def run(only_forward=False):
             # get one batch from main training dataset
             X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = training_data_iter.next()
 
-            if FLAGS.truncate_train_batch:
-                X_batch, transitions_batch = truncate(
-                    X_batch, transitions_batch, num_transitions_batch)
-
-            total_tokens += num_transitions_batch.ravel().sum()
-
             # get one batch from ppdb
             ppdb_X_batch, ppdb_transitions_batch, ppdb_y_batch, ppdb_num_transitions_batch, ppdb_train_ids = ppdb_training_data_iter.next()
-            if FLAGS.truncate_train_batch:
-                ppdb_X_batch, ppdb_transitions_batch = truncate(ppdb_X_batch, ppdb_transitions_batch, ppdb_num_transitions_batch)
 
 
             # Reset cached gradients.
@@ -465,63 +454,17 @@ def run(only_forward=False):
             # class accuracy of ppdb
             ppdb_target = torch.from_numpy(ppdb_y_batch).long()
             ppdb_pred = ppdb_logits.data.max(1)[1].cpu()
-            ppdb_class_acc = ppdb_pred.eq(ppdb_target).sum() / float(target_ppdb.size(0))
 
-            # keep metric
-            A.add('class_acc', class_acc)
-            M.add('class_acc', class_acc)
-            A.add('ppdb_class_acc', ppdb_class_acc)
-            M.add('ppdb_class_acc', ppdb_class_acc)
 
             # Calculate class loss.
             xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
 
-
             # Extract L2 Cost
             l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
-
-            # Boilerplate for calculating loss values.
-            xent_cost_val = xent_loss.data[0]
-            transition_cost_val = transition_loss.data[0] if transition_loss is not None else 0.0
-            l2_cost_val = l2_loss.data[0] if l2_loss is not None else 0.0
-            rl_cost_val = rl_loss.data[0] if rl_loss is not None else 0.0
-            policy_cost_val = policy_loss.data[0] if policy_loss is not None else 0.0
-            rae_cost_val = rae_loss.data[0] if rae_loss is not None else 0.0
-            leaf_cost_val = leaf_loss.data[0] if leaf_loss is not None else 0.0
-            gen_cost_val = gen_loss.data[0] if gen_loss is not None else 0.0
-
-            # Accumulate Total Loss Data
-            total_cost_val = 0.0
-            total_cost_val += xent_cost_val
-            if transition_loss is not None and model.optimize_transition_loss:
-                total_cost_val += transition_cost_val
-            total_cost_val += l2_cost_val
-            total_cost_val += rl_cost_val
-            total_cost_val += policy_cost_val
-            total_cost_val += rae_cost_val
-            total_cost_val += leaf_cost_val
-            total_cost_val += gen_cost_val
-
-            M.add('total_cost', total_cost_val)
-            M.add('xent_cost', xent_cost_val)
-            M.add('transition_cost', transition_cost_val)
-            M.add('l2_cost', l2_cost_val)
-
-            # Logging for RL
-            rl_keys = ['rl_loss', 'policy_loss', 'norm_rewards', 'norm_baseline', 'norm_advantage']
-            for k in rl_keys:
-                if hasattr(model, k):
-                    val = getattr(model, k)
-                    val = val.data[0] if isinstance(val, Variable) else val
-                    M.add(k, val)
 
             # Accumulate Total Loss Variable
             total_loss = 0.0
             total_loss += xent_loss
-            if l2_loss is not None:
-                total_loss += l2_loss
-            if transition_loss is not None and model.optimize_transition_loss:
-                total_loss += transition_loss
 
 
             # Backward pass.
@@ -544,66 +487,26 @@ def run(only_forward=False):
 
             total_time = end - start
 
-            A.add('total_tokens', total_tokens)
             A.add('total_time', total_time)
 
             if step % FLAGS.statistics_interval_steps == 0:
                 progress_bar.step(i=FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
                 progress_bar.finish()
                 avg_class_acc = A.get_avg('class_acc')
-                if transition_loss is not None:
-                    all_preds = np.array(flatten(A.get('preds')))
-                    all_truth = np.array(flatten(A.get('truth')))
-                    avg_trans_acc = (all_preds == all_truth).sum() / float(all_truth.shape[0])
-                else:
-                    avg_trans_acc = 0.0
-                if leaf_loss is not None:
-                    avg_leaf_acc = A.get_avg('leaf_acc')
-                else:
-                    avg_leaf_acc = 0.0
-                if gen_loss is not None:
-                    avg_gen_acc = A.get_avg('gen_acc')
-                else:
-                    avg_gen_acc = 0.0
                 time_metric = time_per_token(A.get('total_tokens'), A.get('total_time'))
                 stats_args = {
                     "step": step,
                     "class_acc": avg_class_acc,
-                    "transition_acc": avg_trans_acc,
                     "total_cost": total_cost_val,
                     "xent_cost": xent_cost_val,
-                    "transition_cost": transition_cost_val,
                     "l2_cost": l2_cost_val,
-                    "rl_cost": rl_cost_val,
-                    "policy_cost": policy_cost_val,
-                    "rae_cost": rae_cost_val,
-                    "leaf_acc": avg_leaf_acc,
-                    "leaf_cost": leaf_cost_val,
-                    "gen_acc": avg_gen_acc,
-                    "gen_cost": gen_cost_val,
                     "time": time_metric,
                 }
                 stats_str = "Step: {step}"
 
                 # Accuracy Component.
-                stats_str += " Acc: {class_acc:.5f} {transition_acc:.5f}"
-                if leaf_loss is not None:
-                    stats_str += " leaf{leaf_acc:.5f}"
-                if gen_loss is not None:
-                    stats_str += " gen{gen_acc:.5f}"
 
                 # Cost Component.
-                stats_str += " Cost: {total_cost:.5f} {xent_cost:.5f} {transition_cost:.5f} {l2_cost:.5f}"
-                if rl_loss is not None:
-                    stats_str += " r{rl_cost:.5f}"
-                if policy_loss is not None:
-                    stats_str += " p{policy_cost:.5f}"
-                if rae_loss is not None:
-                    stats_str += " rae{rae_cost:.5f}"
-                if leaf_loss is not None:
-                    stats_str += " leaf{leaf_cost:.5f}"
-                if gen_loss is not None:
-                    stats_str += " gen{gen_cost:.5f}"
 
                 # Time Component.
                 stats_str += " Time: {time:.5f}"
@@ -657,10 +560,7 @@ if __name__ == '__main__':
     gflags.DEFINE_string("eval_data_path", None, "Can contain multiple file paths, separated "
         "using ':' tokens. The first file should be the dev set, and is used for determining "
         "when to save the early stopping 'best' checkpoints.")
-    gflags.DEFINE_integer("seq_length", 30, "")
     gflags.DEFINE_integer("eval_seq_length", None, "")
-    gflags.DEFINE_boolean("truncate_eval_batch", True, "Shorten batches to max transition length.")
-    gflags.DEFINE_boolean("truncate_train_batch", True, "Shorten batches to max transition length.")
     gflags.DEFINE_boolean("smart_batching", True, "Organize batches using sequence length.")
     gflags.DEFINE_boolean("use_peano", True, "A mind-blowing sorting key.")
     gflags.DEFINE_integer("eval_data_limit", -1, "Truncate evaluation set. -1 indicates no truncation.")
