@@ -52,6 +52,126 @@ import logging
 
 FLAGS = gflags.FLAGS
 
+def define_flags():
+    # Debug settings.
+    gflags.DEFINE_bool("debug", False, "Set to True to disable debug_mode and type_checking.")
+    gflags.DEFINE_bool("show_progress_bar", True, "Turn this off when running experiments on HPC.")
+    gflags.DEFINE_string("branch_name", "", "")
+    gflags.DEFINE_integer("deque_length", None, "Max trailing examples to use for statistics.")
+    gflags.DEFINE_string("sha", "", "")
+    gflags.DEFINE_string("experiment_name", "", "")
+
+    # Data types.
+    gflags.DEFINE_enum("data_type", "bl", ["bl", "sst", "snli", "arithmetic"],
+                       "Which data handler and classifier to use.")
+
+    # Where to store checkpoints
+    gflags.DEFINE_string("ckpt_path", ".", "Where to save/load checkpoints. Can be either "
+                                           "a filename or a directory. In the latter case, the experiment name serves as the "
+                                           "base for the filename.")
+    gflags.DEFINE_string("metrics_path", ".", "A directory in which to write logs.")
+    gflags.DEFINE_string("log_path", ".", "A directory in which to write logs.")
+    gflags.DEFINE_integer("ckpt_step", 1000, "Steps to run before considering saving checkpoint.")
+    gflags.DEFINE_boolean("load_best", False, "If True, attempt to load 'best' checkpoint.")
+
+    # Data settings.
+    gflags.DEFINE_string("training_data_path", None, "")
+    gflags.DEFINE_string("eval_data_path", None, "Can contain multiple file paths, separated "
+                                                 "using ':' tokens. The first file should be the dev set, and is used for determining "
+                                                 "when to save the early stopping 'best' checkpoints.")
+    gflags.DEFINE_integer("seq_length", 150, "")
+    gflags.DEFINE_integer("eval_seq_length", None, "")
+    gflags.DEFINE_boolean("smart_batching", True, "Organize batches using sequence length.")
+    gflags.DEFINE_boolean("use_peano", True, "A mind-blowing sorting key.")
+    gflags.DEFINE_integer("eval_data_limit", -1, "Truncate evaluation set. -1 indicates no truncation.")
+    gflags.DEFINE_boolean("bucket_eval", True, "Bucket evaluation data for speed improvement.")
+    gflags.DEFINE_boolean("shuffle_eval", False, "Shuffle evaluation data.")
+    gflags.DEFINE_integer("shuffle_eval_seed", 123, "Seed shuffling of eval data.")
+    gflags.DEFINE_string("embedding_data_path", None,
+                         "If set, load GloVe-formatted embeddings from here.")
+
+    # Data preprocessing settings.
+    gflags.DEFINE_boolean("use_skips", False, "Pad transitions with SKIP actions.")
+    gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
+
+    # Model architecture settings.
+    gflags.DEFINE_enum("model_type", "ATT_SPINN_PPDB", ["ATT_SPINN_PPDB"], "")
+    gflags.DEFINE_integer("gpu", -1, "")
+    gflags.DEFINE_integer("model_dim", 8, "")
+    gflags.DEFINE_integer("word_embedding_dim", 8, "")
+    gflags.DEFINE_boolean("lowercase", False, "When True, ignore case.")
+    gflags.DEFINE_boolean("use_internal_parser", False, "Use predicted parse.")
+    gflags.DEFINE_boolean("validate_transitions", True,
+                          "Constrain predicted transitions to ones that give a valid parse tree.")
+    gflags.DEFINE_float("embedding_keep_rate", 0.9,
+                        "Used for dropout on transformed embeddings and in the encoder RNN.")
+    gflags.DEFINE_boolean("force_transition_loss", False, "")
+    gflags.DEFINE_boolean("use_l2_cost", True, "")
+    gflags.DEFINE_boolean("use_difference_feature", True, "")
+    gflags.DEFINE_boolean("use_product_feature", True, "")
+
+    # Tracker settings.
+    gflags.DEFINE_integer("tracking_lstm_hidden_dim", None, "Set to none to avoid using tracker.")
+    gflags.DEFINE_float("transition_weight", None, "Set to none to avoid predicting transitions.")
+    gflags.DEFINE_boolean("lateral_tracking", True,
+                          "Use previous tracker state as input for new state.")
+    gflags.DEFINE_boolean("use_tracking_in_composition", True,
+                          "Use tracking lstm output as input for the reduce function.")
+
+    # Encode settings.
+    gflags.DEFINE_boolean("use_encode", False, "Encode embeddings with sequential network.")
+    gflags.DEFINE_enum("encode_style", None, ["LSTM", "CNN", "QRNN"], "Encode embeddings with sequential context.")
+    gflags.DEFINE_boolean("encode_reverse", False, "Encode in reverse order.")
+    gflags.DEFINE_boolean("encode_bidirectional", False, "Encode in both directions.")
+    gflags.DEFINE_integer("encode_num_layers", 1, "RNN layers in encoding net.")
+
+    # MLP settings.
+    gflags.DEFINE_integer("mlp_dim", 1024, "Dimension of intermediate MLP layers.")
+    gflags.DEFINE_integer("num_mlp_layers", 2, "Number of MLP layers.")
+    gflags.DEFINE_boolean("mlp_bn", True, "When True, batch normalization is used between MLP layers.")
+    gflags.DEFINE_float("semantic_classifier_keep_rate", 0.9,
+                        "Used for dropout in the semantic task classifier.")
+
+    # Optimization settings.
+    gflags.DEFINE_enum("optimizer_type", "Adam", ["Adam", "RMSprop"], "")
+    gflags.DEFINE_integer("training_steps", 500000, "Stop training after this point.")
+    gflags.DEFINE_integer("batch_size", 32, "SGD minibatch size.")
+    gflags.DEFINE_float("learning_rate", 0.001, "Used in optimizer.")
+    gflags.DEFINE_float("learning_rate_decay_per_10k_steps", 0.75, "Used in optimizer.")
+    gflags.DEFINE_boolean("actively_decay_learning_rate", True, "Used in optimizer.")
+    gflags.DEFINE_float("clipping_max_value", 5.0, "")
+    gflags.DEFINE_float("l2_lambda", 1e-5, "")
+    gflags.DEFINE_float("init_range", 0.005, "Mainly used for softmax parameters. Range for uniform random init.")
+
+    # Display settings.
+    gflags.DEFINE_integer("statistics_interval_steps", 100, "when to plot and keep statistic")
+    gflags.DEFINE_integer("eval_interval_steps", 1000, "When to do an evaluation and keep checkpoint")
+    gflags.DEFINE_boolean("ckpt_on_best_dev_error", True, "If error on the first eval set (the dev set) is "
+                                                          "at most 0.99 of error at the previous checkpoint, save a special 'best' checkpoint.")
+
+    # Attention model settings
+    gflags.DEFINE_boolean("using_diff_in_mlstm", False,
+                          "use (ak - hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
+    gflags.DEFINE_boolean("using_prod_in_mlstm", False,
+                          "use (ak * hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
+    gflags.DEFINE_boolean("using_null_in_attention", False,
+                          "use null vector in premise stack so that some weights can be assigned")
+    gflags.DEFINE_boolean("saving_eval_attention_matrix", False, "Whether to save the attention matrix when evaluation")
+    gflags.DEFINE_boolean("using_only_mlstm_feature", False,
+                          "Whether to use only matching lstm as the feature input in MLP")
+
+    # PPDB data settings
+    gflags.DEFINE_string("ppdb_path", None, "ppdb data path")
+    gflags.DEFINE_integer("ppdb_limit", None, "number of samples used in training, unlimited if none")
+    gflags.DEFINE_float("ppdb_loss_weight", 1.0, "weight of ppdb loss")
+
+    # Evaluation settings
+    gflags.DEFINE_boolean("expanded_eval_only_mode", False,
+                          "If set, a checkpoint is loaded and a forward pass is done to get the predicted "
+                          "transitions. The inferred parses are written to the supplied file(s) along with example-"
+                          "by-example accuracy information. Requirements: Must specify checkpoint path.")
+    gflags.DEFINE_boolean("write_eval_report", False, "")
+
 
 def sequential_only():
     return FLAGS.model_type == "RNN" or FLAGS.model_type == "CBOW"
@@ -97,15 +217,14 @@ def evaluate(model, eval_set, logger, metrics_logger, step, vocabulary=None):
     transition_targets = []
 
     for i, (eval_X_batch, eval_transitions_batch, eval_y_batch, eval_num_transitions_batch, eval_ids) in enumerate(dataset):
-        if FLAGS.truncate_eval_batch:
-            eval_X_batch, eval_transitions_batch = truncate(
-                eval_X_batch, eval_transitions_batch, eval_num_transitions_batch)
 
         if FLAGS.saving_eval_attention_matrix:
             model.set_recording_attention_weight_matrix(True)
 
         # Run model.
-        output = model(eval_X_batch, eval_transitions_batch, eval_y_batch,
+        output = model(eval_X_batch, eval_transitions_batch,
+                       True,        # main dataset
+                       eval_y_batch,
             use_internal_parser=FLAGS.use_internal_parser,
             validate_transitions=FLAGS.validate_transitions,)
 
@@ -221,7 +340,6 @@ def run(only_forward=False):
     if not os.path.exists(metrics_path):
         os.makedirs(metrics_path)
     metrics_logger = MetricsLogger(metrics_path)
-    M = Accumulator(maxlen=FLAGS.deque_length)
 
     # Load the data.
     raw_training_data, vocabulary = data_manager.load_data(
@@ -378,6 +496,7 @@ def run(only_forward=False):
         logger.Log("Resuming at step: {} with best dev accuracy: {}".format(step, 1. - best_dev_error))
     else:
         assert not only_forward, "Can't run an eval-only run without a checkpoint. Supply a checkpoint."
+        step = 1
         best_dev_error = 1.0
 
     # Print model size.
@@ -397,8 +516,7 @@ def run(only_forward=False):
         self.debug = FLAGS.debug
     model.apply(set_debug)
 
-    # Accumulate useful statistics.
-    A = Accumulator(maxlen=FLAGS.deque_length)
+
 
     # Do an evaluation-only run.
     if only_forward:
@@ -412,6 +530,10 @@ def run(only_forward=False):
         progress_bar = SimpleProgressBar(msg="Training", bar_length=60, enabled=FLAGS.show_progress_bar)
         progress_bar.step(i=0, total=FLAGS.statistics_interval_steps)
 
+        # Accumulate useful statistics.
+        statis = Accumulator(maxlen=FLAGS.deque_length)
+
+        for step in range(step, FLAGS.training_steps + 1):
 
             # set training mode, pytorch framework
             model.train()
@@ -424,6 +546,9 @@ def run(only_forward=False):
             # get one batch from ppdb
             ppdb_X_batch, ppdb_transitions_batch, ppdb_y_batch, ppdb_num_transitions_batch, ppdb_train_ids = ppdb_training_data_iter.next()
 
+            total_tokens = sum([(n+1)/2 for n in num_transitions_batch.reshape(-1)]) \
+                           + sum([(n+1)/2 for n in ppdb_num_transitions_batch.reshape(-1)])     # change it to
+            statis.add('total_tokens', total_tokens)
 
             # Reset cached gradients.
             optimizer.zero_grad()
@@ -438,6 +563,7 @@ def run(only_forward=False):
             # Normalize output.
             logits = F.log_softmax(output)
 
+            # run model with ppdb data set
             output_ppdb = model(ppdb_X_batch, ppdb_transitions_batch,
                                 False,  # ppdb data set
                                 y_batch=ppdb_y_batch,
@@ -454,18 +580,29 @@ def run(only_forward=False):
             # class accuracy of ppdb
             ppdb_target = torch.from_numpy(ppdb_y_batch).long()
             ppdb_pred = ppdb_logits.data.max(1)[1].cpu()
+            ppdb_class_acc = ppdb_pred.eq(ppdb_target).sum() / float(ppdb_target.size(0))
 
 
             # Calculate class loss.
             xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
+            ppdb_xent_loss = nn.NLLLoss()(ppdb_logits, to_gpu(Variable(ppdb_target, volatile=False)))
+            xent_cost_val = xent_loss.data[0]
+            ppdb_xent_cost_val = ppdb_xent_loss.data[0]
 
             # Extract L2 Cost
             l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
+            l2_cost_val = l2_loss.data[0] if l2_loss else 0
 
             # Accumulate Total Loss Variable
             total_loss = 0.0
             total_loss += xent_loss
+            total_loss += ppdb_xent_loss * FLAGS.ppdb_loss_weight   # should be tuned
+            if l2_loss is not None: total_loss += l2_loss
+            total_cost_val = total_loss.data[0]
 
+            # keep metric
+            statis.add('class_acc', class_acc)
+            statis.add('ppdb_class_acc', ppdb_class_acc)
 
             # Backward pass.
             total_loss.backward()
@@ -484,35 +621,26 @@ def run(only_forward=False):
             optimizer.step()
 
             end = time.time()
-
             total_time = end - start
 
-            A.add('total_time', total_time)
+            statis.add('total_time', total_time)
 
             if step % FLAGS.statistics_interval_steps == 0:
                 progress_bar.step(i=FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
                 progress_bar.finish()
-                avg_class_acc = A.get_avg('class_acc')
-                time_metric = time_per_token(A.get('total_tokens'), A.get('total_time'))
-                stats_args = {
-                    "step": step,
-                    "class_acc": avg_class_acc,
-                    "total_cost": total_cost_val,
-                    "xent_cost": xent_cost_val,
-                    "l2_cost": l2_cost_val,
-                    "time": time_metric,
-                }
-                stats_str = "Step: {step}"
+                avg_class_acc = statis.get_avg('class_acc')
+                ppdb_avg_class_acc = statis.get_avg('ppdb_class_acc')
+                time_metric = time_per_token(statis.get('total_tokens'), statis.get('total_time'))
 
-                # Accuracy Component.
+                logstr = ''
+                logstr += 'Step: {}'.format(step)
+                logstr += ' Acc: {:.5f} {:.5f}'.format(avg_class_acc, ppdb_avg_class_acc)
+                logstr += ' Cost(last step): {:.5f} {:.5f} {:.5f} {:.5f}'.format(total_cost_val, xent_cost_val, ppdb_xent_cost_val, l2_cost_val)
+                logstr += ' Time: {:.5f}'.format(time_metric)
+                logger.Log(logstr)
 
-                # Cost Component.
-
-                # Time Component.
-                stats_str += " Time: {time:.5f}"
-                logger.Log(stats_str.format(**stats_args))
-
-            if step > 0 and step % FLAGS.eval_interval_steps == 0:
+            if step % FLAGS.eval_interval_steps == 0:
+                # do evaluation
                 for index, eval_set in enumerate(eval_iterators):
                     acc = evaluate(model, eval_set, logger, metrics_logger, step)
                     if FLAGS.ckpt_on_best_dev_error and index == 0 and (1 - acc) < 0.99 * best_dev_error and step > FLAGS.ckpt_step:
@@ -521,134 +649,23 @@ def run(only_forward=False):
                         classifier_trainer.save(best_checkpoint_path, step, best_dev_error)
                 progress_bar.reset()
 
-            if step > FLAGS.ckpt_step and step % FLAGS.ckpt_interval_steps == 0:
+            if step % FLAGS.ckpt_step == 0:
                 logger.Log("Checkpointing.")
                 classifier_trainer.save(standard_checkpoint_path, step, best_dev_error)
 
-            if step % FLAGS.metrics_interval_steps == 0:
-                m_keys = M.cache.keys()
+            if step % FLAGS.statistics_interval_steps == 0:
+                m_keys = statis.cache.keys()
                 for k in m_keys:
-                    metrics_logger.Log(k, M.get_avg(k), step)
+                    metrics_logger.Log(k, statis.get_avg(k), step)
+                statis = Accumulator(maxlen=FLAGS.deque_length)
 
             progress_bar.step(i=step % FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
 
 
+
 if __name__ == '__main__':
-    # Debug settings.
-    gflags.DEFINE_bool("debug", False, "Set to True to disable debug_mode and type_checking.")
-    gflags.DEFINE_bool("show_progress_bar", True, "Turn this off when running experiments on HPC.")
-    gflags.DEFINE_string("branch_name", "", "")
-    gflags.DEFINE_integer("deque_length", None, "Max trailing examples to use for statistics.")
-    gflags.DEFINE_string("sha", "", "")
-    gflags.DEFINE_string("experiment_name", "", "")
 
-    # Data types.
-    gflags.DEFINE_enum("data_type", "bl", ["bl", "sst", "snli", "arithmetic"],
-        "Which data handler and classifier to use.")
-
-    # Where to store checkpoints
-    gflags.DEFINE_string("ckpt_path", ".", "Where to save/load checkpoints. Can be either "
-        "a filename or a directory. In the latter case, the experiment name serves as the "
-        "base for the filename.")
-    gflags.DEFINE_string("metrics_path", ".", "A directory in which to write logs.")
-    gflags.DEFINE_string("log_path", ".", "A directory in which to write logs.")
-    gflags.DEFINE_integer("ckpt_step", 1000, "Steps to run before considering saving checkpoint.")
-    gflags.DEFINE_boolean("load_best", False, "If True, attempt to load 'best' checkpoint.")
-
-    # Data settings.
-    gflags.DEFINE_string("training_data_path", None, "")
-    gflags.DEFINE_string("eval_data_path", None, "Can contain multiple file paths, separated "
-        "using ':' tokens. The first file should be the dev set, and is used for determining "
-        "when to save the early stopping 'best' checkpoints.")
-    gflags.DEFINE_integer("eval_seq_length", None, "")
-    gflags.DEFINE_boolean("smart_batching", True, "Organize batches using sequence length.")
-    gflags.DEFINE_boolean("use_peano", True, "A mind-blowing sorting key.")
-    gflags.DEFINE_integer("eval_data_limit", -1, "Truncate evaluation set. -1 indicates no truncation.")
-    gflags.DEFINE_boolean("bucket_eval", True, "Bucket evaluation data for speed improvement.")
-    gflags.DEFINE_boolean("shuffle_eval", False, "Shuffle evaluation data.")
-    gflags.DEFINE_integer("shuffle_eval_seed", 123, "Seed shuffling of eval data.")
-    gflags.DEFINE_string("embedding_data_path", None,
-        "If set, load GloVe-formatted embeddings from here.")
-
-    # Data preprocessing settings.
-    gflags.DEFINE_boolean("use_skips", False, "Pad transitions with SKIP actions.")
-    gflags.DEFINE_boolean("use_left_padding", True, "Pad transitions only on the LHS.")
-
-    # Model architecture settings.
-    gflags.DEFINE_enum("model_type", "ATT_SPINN_PPDB", ["ATT_SPINN_PPDB"], "")
-    gflags.DEFINE_integer("gpu", -1, "")
-    gflags.DEFINE_integer("model_dim", 8, "")
-    gflags.DEFINE_integer("word_embedding_dim", 8, "")
-    gflags.DEFINE_boolean("lowercase", False, "When True, ignore case.")
-    gflags.DEFINE_boolean("use_internal_parser", False, "Use predicted parse.")
-    gflags.DEFINE_boolean("validate_transitions", True,
-        "Constrain predicted transitions to ones that give a valid parse tree.")
-    gflags.DEFINE_float("embedding_keep_rate", 0.9,
-        "Used for dropout on transformed embeddings and in the encoder RNN.")
-    gflags.DEFINE_boolean("force_transition_loss", False, "")
-    gflags.DEFINE_boolean("use_l2_cost", True, "")
-    gflags.DEFINE_boolean("use_difference_feature", True, "")
-    gflags.DEFINE_boolean("use_product_feature", True, "")
-
-    # Tracker settings.
-    gflags.DEFINE_integer("tracking_lstm_hidden_dim", None, "Set to none to avoid using tracker.")
-    gflags.DEFINE_float("transition_weight", None, "Set to none to avoid predicting transitions.")
-    gflags.DEFINE_boolean("lateral_tracking", True,
-        "Use previous tracker state as input for new state.")
-    gflags.DEFINE_boolean("use_tracking_in_composition", True,
-        "Use tracking lstm output as input for the reduce function.")
-
-    # Encode settings.
-    gflags.DEFINE_boolean("use_encode", False, "Encode embeddings with sequential network.")
-    gflags.DEFINE_enum("encode_style", None, ["LSTM", "CNN", "QRNN"], "Encode embeddings with sequential context.")
-    gflags.DEFINE_boolean("encode_reverse", False, "Encode in reverse order.")
-    gflags.DEFINE_boolean("encode_bidirectional", False, "Encode in both directions.")
-    gflags.DEFINE_integer("encode_num_layers", 1, "RNN layers in encoding net.")
-
-    # MLP settings.
-    gflags.DEFINE_integer("mlp_dim", 1024, "Dimension of intermediate MLP layers.")
-    gflags.DEFINE_integer("num_mlp_layers", 2, "Number of MLP layers.")
-    gflags.DEFINE_boolean("mlp_bn", True, "When True, batch normalization is used between MLP layers.")
-    gflags.DEFINE_float("semantic_classifier_keep_rate", 0.9,
-        "Used for dropout in the semantic task classifier.")
-
-    # Optimization settings.
-    gflags.DEFINE_enum("optimizer_type", "Adam", ["Adam", "RMSprop"], "")
-    gflags.DEFINE_integer("training_steps", 500000, "Stop training after this point.")
-    gflags.DEFINE_integer("batch_size", 32, "SGD minibatch size.")
-    gflags.DEFINE_float("learning_rate", 0.001, "Used in optimizer.")
-    gflags.DEFINE_float("learning_rate_decay_per_10k_steps", 0.75, "Used in optimizer.")
-    gflags.DEFINE_boolean("actively_decay_learning_rate", True, "Used in optimizer.")
-    gflags.DEFINE_float("clipping_max_value", 5.0, "")
-    gflags.DEFINE_float("l2_lambda", 1e-5, "")
-    gflags.DEFINE_float("init_range", 0.005, "Mainly used for softmax parameters. Range for uniform random init.")
-
-    # Display settings.
-    gflags.DEFINE_integer("statistics_interval_steps", 100, "Print training set results at this interval.")
-    gflags.DEFINE_integer("metrics_interval_steps", 10, "Evaluate at this interval.")
-    gflags.DEFINE_integer("eval_interval_steps", 100, "Evaluate at this interval.")
-    gflags.DEFINE_integer("ckpt_interval_steps", 5000, "Update the checkpoint on disk at this interval.")
-    gflags.DEFINE_boolean("ckpt_on_best_dev_error", True, "If error on the first eval set (the dev set) is "
-        "at most 0.99 of error at the previous checkpoint, save a special 'best' checkpoint.")
-
-    # Attention model settings
-    gflags.DEFINE_boolean("using_diff_in_mlstm", False, "use (ak - hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
-    gflags.DEFINE_boolean("using_prod_in_mlstm", False, "use (ak * hk) as a feature, ak is attention vector, hk is the vector of hypothesis in step k")
-    gflags.DEFINE_boolean("using_null_in_attention", False, "use null vector in premise stack so that some weights can be assigned")
-    gflags.DEFINE_boolean("saving_eval_attention_matrix", False, "Whether to save the attention matrix when evaluation")
-    gflags.DEFINE_boolean("using_only_mlstm_feature", False, "Whether to use only matching lstm as the feature input in MLP")
-
-    # PPDB data settings
-    gflags.DEFINE_string("ppdb_path", None, "ppdb data path")
-    gflags.DEFINE_integer("ppdb_limit", None, "number of samples used in training, unlimited if none")
-
-
-    # Evaluation settings
-    gflags.DEFINE_boolean("expanded_eval_only_mode", False,
-        "If set, a checkpoint is loaded and a forward pass is done to get the predicted "
-        "transitions. The inferred parses are written to the supplied file(s) along with example-"
-        "by-example accuracy information. Requirements: Must specify checkpoint path.")
-    gflags.DEFINE_boolean("write_eval_report", False, "")
+    define_flags()
 
     # Parse command line flags.
     FLAGS(sys.argv)
@@ -672,3 +689,5 @@ if __name__ == '__main__':
         FLAGS.encode_style = "LSTM"
 
     run(only_forward=FLAGS.expanded_eval_only_mode)
+
+
