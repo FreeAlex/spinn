@@ -40,6 +40,7 @@ from spinn.util.misc import Accumulator, time_per_token, MetricsLogger, EvalRepo
 from spinn.data.ppdb import load as load_ppdb
 import spinn.att_spinn_multi_mlp
 from itertools import izip
+import resource
 
 # PyTorch
 import torch
@@ -51,6 +52,17 @@ import torch.optim as optim
 import logging
 
 FLAGS = gflags.FLAGS
+
+def get_mem_use():
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    mem = usage[2]
+    measures = ['B', 'KB', 'MB', 'GB', 'TB']
+    for m in measures:
+        if mem > 1024:
+            mem /= 1024.0
+        else:
+            return '{:.2f}{}'.format(mem, m)
+    ValueError("Memory usage too big, bug?")
 
 def define_flags():
     # Debug settings.
@@ -79,7 +91,7 @@ def define_flags():
     gflags.DEFINE_string("eval_data_path", None, "Can contain multiple file paths, separated "
                                                  "using ':' tokens. The first file should be the dev set, and is used for determining "
                                                  "when to save the early stopping 'best' checkpoints.")
-    gflags.DEFINE_integer("seq_length", 150, "")
+    gflags.DEFINE_integer("seq_length", 60, "Sentence are paded with zeros when it's transitions are over this size, #transitions = 2*#tokens -1")
     gflags.DEFINE_integer("eval_seq_length", None, "")
     gflags.DEFINE_boolean("smart_batching", True, "Organize batches using sequence length.")
     gflags.DEFINE_boolean("use_peano", True, "A mind-blowing sorting key.")
@@ -324,6 +336,7 @@ def get_checkpoint_path(ckpt_path, experiment_name, suffix=".ckpt", best=False):
 def run(only_forward=False):
     logger = afs_safe_logger.Logger(os.path.join(FLAGS.log_path, FLAGS.experiment_name) + ".log")
 
+    print 'memory usage, at begin: {}'.format(get_mem_use())
 
     # Select data format.
     if FLAGS.data_type == "snli":
@@ -344,6 +357,7 @@ def run(only_forward=False):
     # Load the data.
     raw_training_data, vocabulary = data_manager.load_data(
         FLAGS.training_data_path, FLAGS.lowercase)
+    print 'memory usage, after loading main training data: {}'.format(get_mem_use())
 
     # Load the eval data.
     raw_eval_sets = []
@@ -351,21 +365,23 @@ def run(only_forward=False):
         for eval_filename in FLAGS.eval_data_path.split(":"):
             raw_eval_data, _ = data_manager.load_data(eval_filename, FLAGS.lowercase)
             raw_eval_sets.append((eval_filename, raw_eval_data))
+    print 'memory usage, after loading main evaluation data: {}'.format(get_mem_use())
 
     # Load the ppdb data.
     logger.Log("Loading ppdb data.")
     raw_ppdb_data, _ = load_ppdb.load_data(FLAGS.ppdb_path, FLAGS.lowercase, limit=FLAGS.ppdb_limit)
     logger.Log('PPDB data size: {}'.format(len(raw_ppdb_data)))
-
+    print 'memory usage, after loading ppdb data: {}'.format(get_mem_use())
 
     # Prepare the vocabulary.
     if not vocabulary:
         logger.Log("In open vocabulary mode. Using loaded embeddings without fine-tuning.")
         vocabulary = util.BuildVocabulary(
-            raw_training_data, raw_eval_sets, FLAGS.embedding_data_path, logger=logger,
+            raw_training_data + raw_ppdb_data, raw_eval_sets, FLAGS.embedding_data_path, logger=logger,
             sentence_pair_data=data_manager.SENTENCE_PAIR_DATA)
     else:
         logger.Log("In fixed vocabulary mode. Training embeddings.")
+    print 'memory usage, after building vocabulary: {}'.format(get_mem_use())
 
     # Load pretrained embeddings.
     if FLAGS.embedding_data_path:
@@ -375,6 +391,8 @@ def run(only_forward=False):
             vocabulary, FLAGS.word_embedding_dim, FLAGS.embedding_data_path)
     else:
         initial_embeddings = None
+    print 'memory usage, after loading embedding: {}'.format(get_mem_use())
+
 
     # Trim dataset, convert token sequences to integer sequences, crop, and
     # pad.
@@ -387,6 +405,8 @@ def run(only_forward=False):
     training_data_iter = util.MakeTrainingIterator(
         training_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano,
         sentence_pair_data=data_manager.SENTENCE_PAIR_DATA)
+    del raw_training_data   # release raw training data
+    print 'memory usage, after preprocessing main training data: {}'.format(get_mem_use())
 
     # Preprocess eval sets.
     eval_iterators = []
@@ -403,16 +423,20 @@ def run(only_forward=False):
             FLAGS.batch_size, FLAGS.eval_data_limit, bucket_eval=FLAGS.bucket_eval,
             shuffle=FLAGS.shuffle_eval, rseed=FLAGS.shuffle_eval_seed)
         eval_iterators.append((filename, eval_it))
-
+    del raw_eval_sets   # release memory resource
+    print 'memory usage, after preprocessing main eval data: {}'.format(get_mem_use())
     # Preprocess ppdb data
     logger.Log("Preprocessing ppdb data.")
     ppdb_data = util.PreprocessDataset(raw_ppdb_data, vocabulary, FLAGS.seq_length, load_ppdb, eval_mode=False, logger=logger,
                                        sentence_pair_data=data_manager.SENTENCE_PAIR_DATA,
                                        for_rnn=sequential_only(),
                                        use_left_padding=FLAGS.use_left_padding)
+    del raw_ppdb_data   # release memeory resource
     ppdb_training_data_iter = util.MakeTrainingIterator(ppdb_data, FLAGS.batch_size, FLAGS.smart_batching, FLAGS.use_peano,
         sentence_pair_data=load_ppdb.SENTENCE_PAIR_DATA)
     logger.Log("Preprocessing ppdb data complete.")
+    print 'memory usage, after preprocessing ppdb data: {}'.format(get_mem_use())
+
 
 
     # Choose model.
