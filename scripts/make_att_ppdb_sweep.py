@@ -23,7 +23,7 @@ gflags.DEFINE_string("log_path", ".", "")
 gflags.DEFINE_string("exp_names", 'ppdb-1', "experiment names, seperate by coma(,)")
 gflags.DEFINE_string("slurm_name", 'ppdb-1', 'the file name of slurm output and err file')
 gflags.DEFINE_integer("mem", 16, "memory should be used for hpc for each task")
-gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn-dev3/python', 'the model path so that spinn can run')
+gflags.DEFINE_string("spinn_path", '/home/xz1364/repos/faspinn-ppdb/python', 'the model path so that spinn can run')
 gflags.DEFINE_bool("using_diff_in_mlstm", True, 'wether or not use diff feature in mlstm')
 gflags.DEFINE_bool('using_prod_in_mlstm', True, 'wether or not use prod feature in mlstm')
 gflags.DEFINE_bool('using_null_in_attention', True, 'wether using null vector in attention, so that weights can assign to null vector')
@@ -159,7 +159,7 @@ print_script_head()
 for exp_name in exp_names:
     params = {}
     print 'echo running experiment {}'.format(exp_name)
-    print 'python -m spinn.models.fat_classifier  --noshow_progress_bar \\'
+    print 'python -m spinn.models.att_spinn_ppdb_trainer  --noshow_progress_bar \\'
     if FLAGS.gpu:
         print ' --gpu 0 \\'
     print ' --experiment_name {} \\'.format(exp_name)
